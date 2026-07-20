@@ -39,7 +39,7 @@ class NotificationService {
     );
 
     await _plugin.initialize(
-      settings: const InitializationSettings(
+      const InitializationSettings(
         android: androidSettings,
         iOS: iosSettings,
       ),
@@ -71,7 +71,7 @@ class NotificationService {
     int hour = 8,
     int minute = 0,
   }) async {
-    await _plugin.cancel(id: _dailyNotificationId);
+    await _plugin.cancel(_dailyNotificationId);
 
     final now = tz.TZDateTime.now(tz.local);
     final scheduledDate = tz.TZDateTime(
@@ -98,12 +98,14 @@ class NotificationService {
     );
 
     await _plugin.zonedSchedule(
-      id: _dailyNotificationId,
-      title: "Today's quote",
-      body: '"${quote.text}" — ${quote.author}',
-      scheduledDate: scheduledDate,
-      notificationDetails: details,
+      _dailyNotificationId,
+      "Today's quote",
+      '"${quote.text}" — ${quote.author}',
+      scheduledDate,
+      details,
       androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation:
+          UILocalNotificationDateInterpretation.absoluteTime,
     );
   }
 }
