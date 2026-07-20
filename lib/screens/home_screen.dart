@@ -45,7 +45,7 @@ class _HomeScreenState extends State<HomeScreen>
   // before you can move on — long enough to actually read it, short
   // enough not to feel like a wait. Going back to re-read a quote
   // you've already sat with is always instant.
-  static const Duration _readCooldown = Duration(seconds: 4);
+  static const Duration _readCooldown = Duration(seconds: 3);
   late final AnimationController _readController;
   bool _canAdvance = false;
   int _currentExploreIndex = 0;

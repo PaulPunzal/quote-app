@@ -77,4 +77,12 @@ class QuoteRepository {
     final authors = all.map((q) => q.author).toSet().toList()..sort();
     return authors;
   }
+
+  /// Adds many user-created quotes at once (bulk import), persists them,
+  /// and refreshes the in-memory cache. Returns the saved quotes.
+  Future<List<Quote>> addCustomQuotes(List<Quote> quotes) async {
+    final saved = await _customQuotes.addQuotes(quotes);
+    _cache = null; // force reload on next loadAll()
+    return saved;
+  }
 }

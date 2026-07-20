@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../models/quote.dart';
 import '../data/quote_repository.dart';
 import '../data/quote_categories.dart';
+import 'bulk_import_screen.dart';
 
 /// A simple form for adding your own quote to the pool. Saved quotes
 /// join the daily rotation immediately and show up in the Browse screen.
@@ -65,6 +66,13 @@ class _AddQuoteScreenState extends State<AddQuoteScreen> {
     if (mounted) Navigator.of(context).pop(true);
   }
 
+  Future<void> _openBulkImport() async {
+    final imported = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => const BulkImportScreen()),
+    );
+    if (imported == true && mounted) Navigator.of(context).pop(true);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -74,6 +82,13 @@ class _AddQuoteScreenState extends State<AddQuoteScreen> {
         backgroundColor: const Color(0xFFFBF3E9),
         foregroundColor: const Color(0xFF3B2E28),
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.upload_file_outlined),
+            tooltip: 'Bulk import (JSON)',
+            onPressed: _openBulkImport,
+          ),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(20),

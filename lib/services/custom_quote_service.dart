@@ -62,4 +62,42 @@ class CustomQuoteService {
       jsonEncode(updated.map((q) => q.toJson()).toList()),
     );
   }
+
+  /// Saves several quotes at once (e.g. from a bulk JSON import). Each
+  /// quote gets a fresh unique id, same as [addQuote] — any incoming
+  /// ids are ignored. Unlike calling [addQuote] in a loop, this does a
+  /// single read-modify-write of SharedPreferences. Returns the quotes
+  /// as actually stored, ids included, in the same order as [quotes].
+  Future<List<Quote>> addQuotes(List<Quote> quotes) async {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = await getAll();
+
+    final now = DateTime.now().microsecondsSinceEpoch;
+    final saved = <Quote>[];
+    for (var i = 0; i < quotes.length; i++) {
+      final quote = quotes[i];
+      final normalizedTags = quote.tags
+          .map(normalizeCategory)
+          .where((t) => t.isNotEmpty)
+          .toSet()
+          .toList();
+
+      saved.add(Quote(
+        // Index suffix avoids id collisions when many quotes land
+        // in the same batch (and thus the same microsecond).
+        id: 'custom_${now}_$i',
+        text: quote.text,
+        author: quote.author.trim().isEmpty ? 'Unknown' : quote.author.trim(),
+        tags: normalizedTags,
+      ));
+    }
+
+    final updated = [...existing, ...saved];
+    await prefs.setString(
+      _key,
+      jsonEncode(updated.map((q) => q.toJson()).toList()),
+    );
+
+    return saved;
+  }
 }
