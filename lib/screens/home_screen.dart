@@ -1,22 +1,25 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
-import '../models/quote.dart';
-import '../services/quote_storage_service.dart';
+import '../models/embedded_reflection.dart';
+import '../services/reflection_daily_service.dart';
+import '../services/reflection_embedding_service.dart';
 import '../services/notification_service.dart';
-import '../data/quote_repository.dart';
+import '../widgets/mood_check_in_sheet.dart';
 import 'browse_screen.dart';
 import 'add_quote_screen.dart';
 
-/// The main screen — shows today's quote, fading in slowly.
-/// The quote itself is picked and persisted by [QuoteStorageService]:
-/// it stays fixed for the whole day and won't repeat until every
-/// quote in the pool has been shown once (then the cycle resets).
+/// The main screen — shows today's reflection, fading in slowly.
 ///
-/// From here you can also enter "explore mode": today's quote
-/// minimizes to a small strip up top, and a swipeable/tappable feed of
-/// other quotes appears below it. Explore mode is purely in-memory —
-/// it never changes which quote is "today's", and nothing about it
-/// is persisted.
+/// Picking is now handled by ReflectionDailyService: mood comes from a
+/// quick check-in sheet, weather is stubbed out for now (see
+/// _currentWeatherId below), and time-of-day is computed automatically
+/// from the clock. Once picked, today's reflection stays fixed for the
+/// rest of the day, same as the old quote system.
+///
+/// Explore mode below still works the same way conceptually — a
+/// shuffled feed of other reflections you can swipe through — but now
+/// pulls from the embedded reflection pool instead of the old tagged
+/// quote pool.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -26,11 +29,12 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen>
     with TickerProviderStateMixin {
-  final QuoteStorageService _storage = QuoteStorageService();
+  final ReflectionDailyService _dailyService = ReflectionDailyService();
+  final ReflectionEmbeddingService _embeddingService =
+      ReflectionEmbeddingService();
   final NotificationService _notifications = NotificationService();
-  final QuoteRepository _repository = QuoteRepository();
 
-  Quote? _quote;
+  EmbeddedReflection? _reflection;
   bool _loading = true;
 
   late final AnimationController _fadeController;
@@ -39,12 +43,8 @@ class _HomeScreenState extends State<HomeScreen>
   // --- Explore mode state ---
   bool _exploring = false;
   final PageController _pageController = PageController();
-  List<Quote> _explorePool = [];
+  List<EmbeddedReflection> _explorePool = [];
 
-  // How long you have to wait the *first* time you land on a quote
-  // before you can move on — long enough to actually read it, short
-  // enough not to feel like a wait. Going back to re-read a quote
-  // you've already sat with is always instant.
   static const Duration _readCooldown = Duration(seconds: 3);
   late final AnimationController _readController;
   bool _canAdvance = false;
@@ -68,7 +68,7 @@ class _HomeScreenState extends State<HomeScreen>
 
     _fadeController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 4), // slow, deliberate fade-in
+      duration: const Duration(seconds: 4),
     );
     _fadeAnimation = CurvedAnimation(
       parent: _fadeController,
@@ -87,47 +87,73 @@ class _HomeScreenState extends State<HomeScreen>
         }
       });
 
-    _loadQuote();
+    _loadReflection();
   }
 
-  Future<void> _loadQuote() async {
-    final todaysQuote = await _storage.getTodaysQuote();
+  /// TODO(weather): stubbed for now — always returns null, so matching
+  /// runs on mood + time only. Once a weather source is wired in, map
+  /// its condition to one of the 'weather_*' ids from
+  /// context_options.json and return that instead.
+  Future<String?> _currentWeatherId() async {
+    return null;
+  }
 
+  Future<void> _loadReflection() async {
+    // If today's reflection was already picked (e.g. reopening the app
+    // later the same day), just show it — no need to ask mood again.
+    final alreadyPicked = await _dailyService.getTodaysReflectionIfAssigned();
+
+    EmbeddedReflection reflection;
+    if (alreadyPicked != null) {
+      reflection = alreadyPicked;
+    } else {
+      if (!mounted) return;
+      final moodId = await MoodCheckInSheet.show(context);
+
+      if (moodId == null) {
+        // Sheet was dismissed without a choice. isDismissible is false
+        // on the sheet itself, so this path is mostly a safety net --
+        // still, don't leave the screen stuck loading forever.
+        if (mounted) setState(() => _loading = false);
+        return;
+      }
+
+      final weatherId = await _currentWeatherId();
+      reflection = await _dailyService.getTodaysReflection(
+        moodId: moodId,
+        weatherId: weatherId,
+      );
+    }
+
+    if (!mounted) return;
     setState(() {
-      _quote = todaysQuote;
+      _reflection = reflection;
       _loading = false;
     });
 
-    // Small delay before starting the fade so the screen doesn't
-    // feel like it's rushing to show something the moment it opens.
     await Future.delayed(const Duration(milliseconds: 400));
     if (mounted) _fadeController.forward();
 
-    // Pre-assign and schedule tomorrow's notification now, while we
-    // have a live app process. See NotificationService for why this
-    // has to happen at open-time rather than at fire-time.
     _scheduleTomorrowNotification();
   }
 
+  /// See the class-level note: tomorrow's *specific* reflection can't
+  /// be pre-picked, because picking depends on tomorrow's mood, which
+  /// isn't known yet. Rather than guess (and risk showing a mismatched
+  /// reflection in the notification body, or reusing today's), this
+  /// schedules a generic, non-spoiling reminder instead. Revisit this
+  /// once there's a plan for mood-independent notification content.
   Future<void> _scheduleTomorrowNotification() async {
-    final tomorrow = DateTime.now().add(const Duration(days: 1));
-    final tomorrowKey = QuoteStorageService.dateToString(tomorrow);
-    final tomorrowsQuote =
-        await _storage.getOrAssignQuoteForDate(tomorrowKey);
-
     await _notifications.init();
-    await _notifications.scheduleTomorrow(
-      quote: tomorrowsQuote,
-      hour: 8, // adjust to your preferred notification time
+    await _notifications.scheduleTomorrowGeneric(
+      hour: 8,
       minute: 0,
     );
   }
 
-  /// Enters explore mode: shuffles the full quote pool and shows it as
-  /// a swipeable/tappable feed, with today's quote minimized above it.
   Future<void> _enterExplore() async {
-    final all = await _repository.loadAll();
-    final shuffled = List<Quote>.from(all)..shuffle();
+    final all = await _embeddingService.allReflections();
+    final shuffled = List<EmbeddedReflection>.from(all)..shuffle();
 
     if (!mounted) return;
     setState(() {
@@ -143,11 +169,6 @@ class _HomeScreenState extends State<HomeScreen>
     setState(() => _exploring = false);
   }
 
-  /// Called whenever the visible quote changes (swipe forward, swipe
-  /// back, or tap-to-advance). If this quote has already had its
-  /// cooldown satisfied before — most commonly because you swiped back
-  /// to re-read it — it's unlocked instantly. Only a genuinely new
-  /// quote starts a fresh cooldown.
   void _startReadCooldown(int index) {
     _currentExploreIndex = index;
 
@@ -167,9 +188,6 @@ class _HomeScreenState extends State<HomeScreen>
       ..forward();
   }
 
-  /// Advances the explore feed by one, looping back to the start at
-  /// the end. Used when the current quote itself is tapped. Blocked
-  /// until the read cooldown for the current quote has finished.
   void _showNextExploreQuote() {
     if (!_canAdvance || _explorePool.length < 2) return;
 
@@ -185,12 +203,20 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   Future<void> _openAddQuote() async {
+    // NOTE: still points at the legacy tag-based Add/Bulk Import flow.
+    // Those screens add to the old Quote pool, which is separate from
+    // the embedded reflection pool used here -- worth deciding
+    // deliberately whether/how user-added entries join the smart
+    // recommender (see earlier discussion: they have no embedding).
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const AddQuoteScreen()),
     );
   }
 
   void _openBrowse() {
+    // NOTE: still browses the legacy tagged Quote pool, not the
+    // embedded reflections. Revisit once Browse is updated to read
+    // from reflections.json.
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const BrowseScreen()),
     );
@@ -207,12 +233,12 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFFBF3E9), // warm cream
+      backgroundColor: const Color(0xFFFBF3E9),
       appBar: AppBar(
         backgroundColor: const Color(0xFFFBF3E9),
         foregroundColor: const Color(0xFF3B2E28),
         elevation: 0,
-        title: const Text('Daily Quote'),
+        title: const Text('Daily Reflection'),
         actions: [
           IconButton(
             icon: const Icon(Icons.menu_book_outlined),
@@ -235,11 +261,8 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  /// Today's fixed quote, centered and dominant, with a quiet entry
-  /// point into explore mode pinned near the bottom of the screen —
-  /// kept separate so it doesn't compete with the quote itself.
   Widget _buildTodayView() {
-    if (_loading) {
+    if (_loading || _reflection == null) {
       return const Center(key: ValueKey('today'), child: _QuietLoadingDot());
     }
 
@@ -252,30 +275,16 @@ class _HomeScreenState extends State<HomeScreen>
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: FadeTransition(
                 opacity: _fadeAnimation,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      '"${_quote!.text}"',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontSize: 22,
-                        fontStyle: FontStyle.italic,
-                        height: 1.5,
-                        color: Color(0xFF3B2E28), // warm dark brown
-                        fontFamily: 'Georgia', // serif, unhurried feel
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    Text(
-                      '— ${_quote!.author}',
-                      style: const TextStyle(
-                        fontSize: 14,
-                        color: Color(0xFF8A6F5C),
-                        letterSpacing: 0.5,
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  _reflection!.text,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 22,
+                    fontStyle: FontStyle.italic,
+                    height: 1.5,
+                    color: Color(0xFF3B2E28),
+                    fontFamily: 'Georgia',
+                  ),
                 ),
               ),
             ),
@@ -286,7 +295,7 @@ class _HomeScreenState extends State<HomeScreen>
           child: TextButton.icon(
             onPressed: _enterExplore,
             icon: const Icon(Icons.shuffle, size: 18),
-            label: const Text('See other quotes'),
+            label: const Text('See other reflections'),
             style: TextButton.styleFrom(
               foregroundColor: const Color(0xFF8A6F5C),
             ),
@@ -296,53 +305,40 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  /// Today's quote minimized up top, plus a swipeable/tappable feed of
-  /// other quotes below it.
   Widget _buildExploreView() {
     return Column(
       key: const ValueKey('explore'),
       children: [
-        if (_quote != null)
-          _MinimizedTodayQuote(quote: _quote!, onTap: _exitExplore),
+        if (_reflection != null)
+          _MinimizedTodayReflection(
+            reflection: _reflection!,
+            onTap: _exitExplore,
+          ),
         Expanded(
           child: _explorePool.isEmpty
-              ? const Center(child: Text('No other quotes yet.'))
+              ? const Center(child: Text('No other reflections yet.'))
               : PageView.builder(
                   controller: _pageController,
                   onPageChanged: _startReadCooldown,
                   itemCount: _explorePool.length,
                   itemBuilder: (context, index) {
-                    final q = _explorePool[index];
+                    final r = _explorePool[index];
                     return GestureDetector(
                       behavior: HitTestBehavior.opaque,
                       onTap: _showNextExploreQuote,
                       child: Padding(
                         padding: const EdgeInsets.symmetric(horizontal: 32),
                         child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                '"${q.text}"',
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  fontSize: 20,
-                                  fontStyle: FontStyle.italic,
-                                  height: 1.5,
-                                  color: Color(0xFF3B2E28),
-                                  fontFamily: 'Georgia',
-                                ),
-                              ),
-                              const SizedBox(height: 18),
-                              Text(
-                                '— ${q.author}',
-                                style: const TextStyle(
-                                  fontSize: 13,
-                                  color: Color(0xFF8A6F5C),
-                                  letterSpacing: 0.5,
-                                ),
-                              ),
-                            ],
+                          child: Text(
+                            r.text,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontStyle: FontStyle.italic,
+                              height: 1.5,
+                              color: Color(0xFF3B2E28),
+                              fontFamily: 'Georgia',
+                            ),
                           ),
                         ),
                       ),
@@ -379,13 +375,14 @@ class _HomeScreenState extends State<HomeScreen>
   }
 }
 
-/// The small pinned strip shown at the top during explore mode. Tapping
-/// it returns you to the full "today" view.
-class _MinimizedTodayQuote extends StatelessWidget {
-  final Quote quote;
+class _MinimizedTodayReflection extends StatelessWidget {
+  final EmbeddedReflection reflection;
   final VoidCallback onTap;
 
-  const _MinimizedTodayQuote({required this.quote, required this.onTap});
+  const _MinimizedTodayReflection({
+    required this.reflection,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -405,7 +402,7 @@ class _MinimizedTodayQuote extends StatelessWidget {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '"${quote.text}" — ${quote.author}',
+                reflection.text,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
@@ -424,8 +421,6 @@ class _MinimizedTodayQuote extends StatelessWidget {
   }
 }
 
-/// A tiny, unobtrusive loading indicator — not a spinner,
-/// keeps the same quiet tone as the rest of the app.
 class _QuietLoadingDot extends StatelessWidget {
   const _QuietLoadingDot();
 
