@@ -1,0 +1,64 @@
+{
+  "quotes": [
+    {
+      "id": "q001",
+      "text": "Some things don't ask to be finished. They just ask to be returned to.",
+      "author": "Unknown",
+      "tags": ["ritual", "patience"]
+    },
+    {
+      "id": "q002",
+      "text": "You do not have to earn the right to rest.",
+      "author": "Unknown",
+      "tags": ["rest", "worth"]
+    },
+    {
+      "id": "q003",
+      "text": "The quiet parts of the day are not empty. They are just unmeasured.",
+      "author": "Unknown",
+      "tags": ["time", "stillness"]
+    },
+    {
+      "id": "q004",
+      "text": "Attention is the simplest form of love.",
+      "author": "Simone Weil",
+      "tags": ["attention", "care"]
+    },
+    {
+      "id": "q005",
+      "text": "Nothing is ever really lost to us as long as we remember it.",
+      "author": "L.M. Montgomery",
+      "tags": ["memory", "gentleness"]
+    },
+    {
+      "id": "q006",
+      "text": "A slow walk is still a walk forward.",
+      "author": "Unknown",
+      "tags": ["movement", "patience"]
+    },
+    {
+      "id": "q007",
+      "text": "You are allowed to take up the same space you did yesterday.",
+      "author": "Unknown",
+      "tags": ["worth", "stillness"]
+    },
+    {
+      "id": "q008",
+      "text": "The plant does not rush toward the sun. It just keeps facing it.",
+      "author": "Unknown",
+      "tags": ["ritual", "patience"]
+    },
+    {
+      "id": "q009",
+      "text": "Being seen by no one does not make a moment less real.",
+      "author": "Unknown",
+      "tags": ["stillness", "worth"]
+    },
+    {
+      "id": "q010",
+      "text": "Small and unfinished is still a shape worth keeping.",
+      "author": "Unknown",
+      "tags": ["patience", "worth"]
+    }
+  ]
+}
