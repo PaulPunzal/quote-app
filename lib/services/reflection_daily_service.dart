@@ -55,10 +55,10 @@ class DailyHeadline {
 /// simpler and safer than writing one-time migration logic for a single
 /// user's local data.
 ///
-/// Picking mechanics (ranking, recency exclusion, pool sampling) are
-/// unchanged from the original single-slot version — see the class doc
-/// in the git history if you want the "why" on the ranking approach.
-/// What's new here is purely the slot dimension.
+/// Picking mechanics: ranks all reflections against the current context
+/// vector, excludes anything shown recently (see [_recentlyShownIds] and
+/// the progressive-relaxation logic in [getSlotReflection]), then picks
+/// randomly from the top [topPoolSize] of what's left.
 class ReflectionDailyService {
   static const _keyAssignedReflections =
       'assigned_reflections_v2'; // date -> {slot -> reflectionId}
@@ -73,7 +73,13 @@ class ReflectionDailyService {
   ReflectionDailyService({
     ReflectionEmbeddingService? embeddingService,
     this.recencyWindowDays = 14,
-    this.topPoolSize = 6,
+    // Wider than before (was 6). A pool this small got exhausted fast
+    // whenever the same mood/weather/time context recurred (which
+    // happens a lot -- moods and weather don't vary infinitely), so
+    // repeats started showing up well before the recency window even
+    // expired. A bigger pool means more genuinely-different picks
+    // before anything has to repeat.
+    this.topPoolSize = 20,
     Random? random,
   })  : _embeddingService = embeddingService ?? ReflectionEmbeddingService(),
         _random = random ?? Random();
@@ -148,18 +154,7 @@ class ReflectionDailyService {
       timeId: resolvedTimeId,
     );
 
-    final recentIds = await _recentlyShownIds(prefs);
-    var ranked = await _embeddingService.rank(
-      contextVector,
-      excludeIds: recentIds,
-    );
-
-    // If recency filtering wiped out (almost) everything -- small
-    // corpora can hit this -- fall back to ranking without the filter
-    // rather than crashing or repeating the exact same reflection.
-    if (ranked.isEmpty) {
-      ranked = await _embeddingService.rank(contextVector);
-    }
+    final ranked = await _rankWithRelaxedRecency(prefs, contextVector);
 
     final poolSize = min(topPoolSize, ranked.length);
     final pool = ranked.take(poolSize).toList();
@@ -171,6 +166,40 @@ class ReflectionDailyService {
     await _appendToHistory(prefs, picked.id, today, slot.storageKey);
 
     return picked;
+  }
+
+  /// Ranks [contextVector] against reflections, excluding recently-shown
+  /// ones -- but instead of an all-or-nothing cutoff (full recency
+  /// window, or none at all), progressively shrinks the recency window
+  /// until there are enough non-recent candidates to fill [topPoolSize].
+  ///
+  /// The old behavior dropped recency exclusion entirely the moment the
+  /// full window's candidates ran dry, which could hand back something
+  /// shown minutes ago. Shrinking the window in steps means the *most*
+  /// recently shown reflections stay excluded for as long as possible,
+  /// and only the least-recently-excluded ones get let back in first.
+  Future<List<ScoredReflection>> _rankWithRelaxedRecency(
+    SharedPreferences prefs,
+    List<double> contextVector,
+  ) async {
+    var window = recencyWindowDays;
+
+    while (true) {
+      final recentIds = await _recentlyShownIds(prefs, windowDays: window);
+      final ranked = await _embeddingService.rank(
+        contextVector,
+        excludeIds: recentIds,
+      );
+
+      if (ranked.length >= topPoolSize || window <= 0) {
+        return ranked;
+      }
+
+      // Not enough fresh candidates yet -- shrink the window (halving,
+      // floor at 0) and try again before giving up recency exclusion
+      // altogether.
+      window = window ~/ 2;
+    }
   }
 
   /// Convenience for a reroll: always picks fresh for [slot], ignoring
@@ -289,13 +318,18 @@ class ReflectionDailyService {
     await prefs.setString(_keyHistory, jsonEncode(history));
   }
 
-  /// Ids shown within the last [recencyWindowDays] days, across all
-  /// slots, used to keep any pick from repeating something shown
-  /// recently regardless of which slot showed it.
-  Future<Set<String>> _recentlyShownIds(SharedPreferences prefs) async {
+  /// Ids shown within the last [windowDays] days, across all slots,
+  /// used to keep any pick from repeating something shown recently
+  /// regardless of which slot showed it. [windowDays] defaults to
+  /// [recencyWindowDays] but callers (see [_rankWithRelaxedRecency]) can
+  /// pass a smaller value to progressively relax the exclusion.
+  Future<Set<String>> _recentlyShownIds(
+    SharedPreferences prefs, {
+    int? windowDays,
+  }) async {
     final history = await _getHistory(prefs);
-    final cutoff =
-        DateTime.now().subtract(Duration(days: recencyWindowDays));
+    final effectiveWindow = windowDays ?? recencyWindowDays;
+    final cutoff = DateTime.now().subtract(Duration(days: effectiveWindow));
 
     final recent = <String>{};
     for (final entry in history) {

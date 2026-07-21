@@ -43,6 +43,11 @@ class ExploreView extends StatelessWidget {
                   physics: canAdvance
                       ? const PageScrollPhysics()
                       : const NeverScrollableScrollPhysics(),
+                  // Finite and non-looping: pool is a handful of
+                  // similar reflections followed by the shuffled rest
+                  // of the corpus (see HomeScreen._enterExplore), so
+                  // there's plenty to swipe through without ever
+                  // repeating.
                   itemCount: pool.length,
                   itemBuilder: (context, index) {
                     final r = pool[index];

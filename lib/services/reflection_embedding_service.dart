@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'package:flutter/services.dart' show rootBundle;
 import '../models/embedded_reflection.dart';
 import '../models/context_option.dart';
@@ -89,18 +90,28 @@ class ReflectionEmbeddingService {
     return sum;
   }
 
-  /// Averages several vectors element-wise. No renormalization needed —
-  /// see the class doc comment for why that's safe for ranking purposes.
-  List<double> _average(List<List<double>> vectors) {
-    final dim = vectors.first.length;
+  /// Weighted element-wise average. Still no renormalization needed —
+  /// see the class doc comment: a weighted sum of unit vectors is just
+  /// a different fixed linear combination, and since the *same*
+  /// resulting vector is compared against every reflection, its scale
+  /// never changes their relative ranking either.
+  List<double> _weightedAverage(
+      List<MapEntry<List<double>, double>> weightedVectors) {
+    final dim = weightedVectors.first.key.length;
     final result = List<double>.filled(dim, 0.0);
-    for (final v in vectors) {
+    var totalWeight = 0.0;
+
+    for (final entry in weightedVectors) {
+      final vector = entry.key;
+      final weight = entry.value;
       for (var i = 0; i < dim; i++) {
-        result[i] += v[i];
+        result[i] += vector[i] * weight;
       }
+      totalWeight += weight;
     }
+
     for (var i = 0; i < dim; i++) {
-      result[i] /= vectors.length;
+      result[i] /= totalWeight;
     }
     return result;
   }
@@ -108,24 +119,45 @@ class ReflectionEmbeddingService {
   /// Builds the "current moment" query vector from up to three context
   /// option ids (mood/weather/time — any can be omitted). At least one
   /// id must be provided.
+  ///
+  /// [moodWeight], [weatherWeight], and [timeWeight] control how much
+  /// each contributes to the final vector. They default to giving
+  /// time-of-day more pull than weather: for the ambient Morning/Evening
+  /// slots (which only ever pass weather + time, no mood), an equal
+  /// average let weather -- which barely changes within a single day --
+  /// wash out the one signal that's actually supposed to tell those two
+  /// slots apart. Weighing time higher makes Morning and Evening
+  /// meaningfully diverge instead of converging on nearly the same
+  /// top matches.
   Future<List<double>> buildContextVector({
     String? moodId,
     String? weatherId,
     String? timeId,
+    double moodWeight = 1.0,
+    double weatherWeight = 0.6,
+    double timeWeight = 1.6,
   }) async {
-    final ids = [moodId, weatherId, timeId].whereType<String>().toList();
-    if (ids.isEmpty) {
+    final weighted = <MapEntry<List<double>, double>>[];
+
+    if (moodId != null) {
+      final option = await _requireContextOption(moodId);
+      weighted.add(MapEntry(option.embedding, moodWeight));
+    }
+    if (weatherId != null) {
+      final option = await _requireContextOption(weatherId);
+      weighted.add(MapEntry(option.embedding, weatherWeight));
+    }
+    if (timeId != null) {
+      final option = await _requireContextOption(timeId);
+      weighted.add(MapEntry(option.embedding, timeWeight));
+    }
+
+    if (weighted.isEmpty) {
       throw ArgumentError(
           'buildContextVector needs at least one of moodId/weatherId/timeId');
     }
 
-    final vectors = <List<double>>[];
-    for (final id in ids) {
-      final option = await _requireContextOption(id);
-      vectors.add(option.embedding);
-    }
-
-    return _average(vectors);
+    return _weightedAverage(weighted);
   }
 
   /// Ranks all reflections against [contextVector], highest similarity
@@ -143,5 +175,45 @@ class ReflectionEmbeddingService {
 
     candidates.sort((a, b) => b.score.compareTo(a.score));
     return candidates;
+  }
+
+  /// Narrows an already-[rank]ed list down to reflections that are
+  /// genuinely close to the top match, rather than an arbitrary fixed
+  /// count.
+  ///
+  /// A flat "take the top N" cutoff has two failure modes on a modest
+  /// corpus: N is small enough to exhaust in a few swipes, and/or N is
+  /// large enough relative to the corpus that it stops meaning
+  /// "similar" and starts meaning "most of everything" — which reads
+  /// as unrelated even though it's technically top-ranked.
+  ///
+  /// [margin] is the max score gap (dot product, since vectors are
+  /// normalized -- see class doc) below the top score that still
+  /// counts as "similar enough". [minPoolSize] guarantees Explore
+  /// always has *something* to shuffle even on a day where nothing is
+  /// within [margin] (falls back to the closest few regardless of
+  /// margin). [maxPoolSize] caps it the other direction so a very
+  /// generic context (matching almost everything closely) doesn't
+  /// hand back the whole corpus.
+  List<ScoredReflection> similarBand(
+    List<ScoredReflection> ranked, {
+    double margin = 0.08,
+    int minPoolSize = 5,
+    int maxPoolSize = 20,
+  }) {
+    if (ranked.isEmpty) return ranked;
+
+    final topScore = ranked.first.score;
+    final band =
+        ranked.where((r) => topScore - r.score <= margin).toList();
+
+    if (band.length >= minPoolSize) {
+      return band.take(maxPoolSize).toList();
+    }
+
+    // Not enough genuinely-close matches -- fall back to the closest
+    // few available so Explore still has something, rather than
+    // returning an under-filled pool.
+    return ranked.take(min(minPoolSize, ranked.length)).toList();
   }
 }

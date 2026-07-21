@@ -376,13 +376,13 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   /// Enters Explore mode. When [contextTimeId] is given (i.e. entering
-  /// from the Morning or Evening tab), the pool is ranked against the
-  /// same weather+time context vector that picked the reflection
-  /// currently shown on that tab -- so swiping through Explore feels
-  /// like a continuation of that same ambient "mood" instead of
-  /// jumping to something tonally random. The top matches are taken as
-  /// a pool and shuffled *within* that pool, so it's not a rigidly
-  /// identical ranked list every time, just a similar-vibe one.
+  /// from the Morning or Evening tab), the pool starts with a small
+  /// handful of reflections genuinely close to the same weather+time
+  /// context that picked the reflection currently shown on that tab --
+  /// so the first few swipes feel like a continuation of that same
+  /// ambient "mood" -- and then the rest of the corpus follows,
+  /// shuffled, so there's always something new to swipe to without
+  /// ever repeating (no looping back to the start).
   ///
   /// [contextTimeId] is omitted only if Explore is ever entered without
   /// a specific ambient tab in mind, in which case it falls back to a
@@ -406,9 +406,28 @@ class _HomeScreenState extends State<HomeScreen>
         contextVector,
         excludeIds: {if (currentId != null) currentId},
       );
-      final poolSize = min(12, ranked.length);
-      pool = ranked.take(poolSize).map((s) => s.reflection).toList()
+
+      // A small, fixed-size "genuinely similar" band up front (see
+      // ReflectionEmbeddingService.similarBand) -- capped at exactly 5
+      // regardless of corpus size, so it stays a handful of honestly
+      // close matches rather than a big chunk of everything.
+      final similar = _embeddingService
+          .similarBand(ranked, minPoolSize: 5, maxPoolSize: 5)
+          .map((s) => s.reflection)
+          .toList()
         ..shuffle();
+      final similarIds = similar.map((r) => r.id).toSet();
+
+      // Everything else in the corpus (still excluding the on-screen
+      // reflection), shuffled, so swiping past the similar handful
+      // leads into fresh, never-repeating material instead of looping.
+      final remainder = ranked
+          .where((s) => !similarIds.contains(s.reflection.id))
+          .map((s) => s.reflection)
+          .toList()
+        ..shuffle();
+
+      pool = [...similar, ...remainder];
     } else {
       final all = await _embeddingService.allReflections();
       pool = List<EmbeddedReflection>.from(all)..shuffle();
