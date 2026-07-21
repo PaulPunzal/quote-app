@@ -7,6 +7,7 @@ import '../services/notification_service.dart';
 import '../services/favorites_service.dart';
 import '../widgets/mood_check_in_sheet.dart';
 import 'browse_screen.dart';
+import 'favorites_screen.dart';
 
 /// The main screen — three tabs:
 ///   - Morning / Evening: ambient picks, auto-assigned on load from
@@ -123,6 +124,17 @@ class _HomeScreenState extends State<HomeScreen>
     final updated = await _favoritesService.toggle(id);
     if (!mounted) return;
     setState(() => _favoriteIds = updated);
+  }
+
+  /// Opens the Favorites list screen. Un-favoriting a reflection while
+  /// there (or anywhere else) changes the same underlying storage, so
+  /// we just reload [_favoriteIds] on return to stay in sync — no need
+  /// to pass data back and forth manually.
+  Future<void> _openFavorites() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => FavoritesScreen()),
+    );
+    await _loadFavorites();
   }
 
   int _initialTabIndex() {
@@ -300,6 +312,11 @@ class _HomeScreenState extends State<HomeScreen>
                 ],
               ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.favorite_border),
+            tooltip: 'Favorites',
+            onPressed: _openFavorites,
+          ),
           IconButton(
             icon: const Icon(Icons.menu_book_outlined),
             tooltip: 'Browse all quotes',
@@ -668,20 +685,14 @@ class _FavoritableReflectionState extends State<_FavoritableReflection>
                   fontFamily: 'Georgia',
                 ),
               ),
-              const SizedBox(height: 18),
-              IconButton(
-                onPressed: () =>
-                    widget.onToggleFavorite(widget.reflectionId),
-                icon: Icon(
-                  widget.isFavorite ? Icons.favorite : Icons.favorite_border,
-                  color: widget.isFavorite
-                      ? const Color(0xFFB5651D)
-                      : const Color(0xFF8A6F5C),
+              if (widget.isFavorite) ...[
+                const SizedBox(height: 18),
+                const Icon(
+                  Icons.favorite,
+                  size: 18,
+                  color: Color(0xFFB5651D),
                 ),
-                tooltip: widget.isFavorite
-                    ? 'Remove from favorites'
-                    : 'Add to favorites',
-              ),
+              ],
             ],
           ),
           IgnorePointer(
