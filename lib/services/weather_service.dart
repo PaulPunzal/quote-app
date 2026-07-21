@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -115,25 +114,7 @@ class WeatherService {
 
   Future<String?> getSavedLocationLabel() async {
     final prefs = await SharedPreferences.getInstance();
-    return _normalizedLabel(prefs, prefs.getString(_keyLabel));
-  }
-
-  /// Trims a stored label down to just the city (everything before the
-  /// first comma). Saves made after the city-only fix are already in
-  /// this shape, but a label saved before that fix would still be the
-  /// full "city, region, country" string sitting in SharedPreferences
-  /// -- this heals that in place the first time it's read, so nobody
-  /// has to re-pick their city just because of an old save.
-  String? _normalizedLabel(SharedPreferences prefs, String? rawLabel) {
-    if (rawLabel == null) return null;
-    final commaIndex = rawLabel.indexOf(',');
-    if (commaIndex == -1) return rawLabel; // already city-only
-
-    final trimmed = rawLabel.substring(0, commaIndex).trim();
-    // Fire-and-forget the rewrite; the caller doesn't need to wait on
-    // this to get the correct (already-computed) label back.
-    unawaited(prefs.setString(_keyLabel, trimmed));
-    return trimmed;
+    return prefs.getString(_keyLabel);
   }
 
   Future<bool> hasLocationConfigured() async {
@@ -161,7 +142,7 @@ class WeatherService {
     final prefs = await SharedPreferences.getInstance();
     final lat = prefs.getDouble(_keyLat);
     final lon = prefs.getDouble(_keyLon);
-    final label = _normalizedLabel(prefs, prefs.getString(_keyLabel));
+    final label = prefs.getString(_keyLabel);
     if (lat == null || lon == null || label == null) return null;
 
     String? conditionId;

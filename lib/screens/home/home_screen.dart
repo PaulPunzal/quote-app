@@ -9,6 +9,7 @@ import '../../services/weather_service.dart';
 import '../../widgets/mood_check_in_sheet.dart';
 import '../browse_screen.dart';
 import '../favorites_screen.dart';
+import '../history_screen.dart';
 import '../weather_location_screen.dart';
 import 'widgets/ambient_tab.dart';
 import 'widgets/explore_view.dart';
@@ -16,11 +17,20 @@ import 'widgets/on_demand_tab.dart';
 import 'widgets/weather_strip.dart';
 
 /// The main screen — three tabs:
-///   - Morning / Evening: ambient picks, auto-assigned on load from
-///     weather + a fixed time-of-day context (not the current clock —
-///     see ReflectionDailyService.getSlotReflection's `timeId` doc).
-///     Fixed for the day once picked, same as the old single-reflection
+///   - Morning / Evening: ambient picks, auto-assigned from weather + a
+///     fixed time-of-day context (not the current clock — see
+///     ReflectionDailyService.getSlotReflection's `timeId` doc). Fixed
+///     for the day once picked, same as the old single-reflection
 ///     behavior.
+///
+///     Morning is picked the moment the app is opened (whenever that
+///     is). Evening is picked lazily — the first time the Evening tab
+///     is actually viewed after 5pm — rather than at the same moment
+///     as morning. That way each slot gets its own fresh weather
+///     reading taken when it's actually needed, instead of both being
+///     decided off a single weather fetch from whenever the app
+///     happened to be opened that day (which could be hours before
+///     evening even arrives).
 ///   - Check in: the old mood-check-in flow, now explicitly triggered
 ///     by a button rather than blocking the screen on load. Supports
 ///     "Something else" to re-roll (re-asking mood) instead of being
@@ -55,7 +65,21 @@ class _HomeScreenState extends State<HomeScreen>
   EmbeddedReflection? _onDemand;
 
   bool _loadingAmbient = true;
+
+  /// Separate from [_loadingAmbient] because evening now loads on its
+  /// own schedule (see class doc) — it can still be "not yet picked"
+  /// well after morning has finished loading.
+  bool _loadingEvening = true;
+
   bool _onDemandLoading = false;
+
+  /// The weatherId actually used (or attempted) the moment each ambient
+  /// slot's weather was fetched. Kept purely so "See other reflections"
+  /// can rank its pool against the same weather+time context the
+  /// currently-shown reflection was picked from, instead of shuffling
+  /// every reflection with no context at all.
+  String? _morningWeatherId;
+  String? _eveningWeatherId;
 
   Set<String> _favoriteIds = {};
 
@@ -103,6 +127,11 @@ class _HomeScreenState extends State<HomeScreen>
       vsync: this,
       initialIndex: _initialTabIndex(),
     );
+    // Evening's reflection is picked lazily (see class doc) — this
+    // catches the case where the app is opened after 5pm and the user
+    // switches back and forth into the Evening tab later in the same
+    // session, or lands there via a tab change rather than at launch.
+    _tabController.addListener(_onTabChanged);
 
     _fadeController = AnimationController(
       vsync: this,
@@ -154,6 +183,16 @@ class _HomeScreenState extends State<HomeScreen>
     await _loadFavorites();
   }
 
+  /// Opens the History screen (everything ever shown, by date/slot).
+  /// Same reasoning as [_openFavorites] -- favoriting is possible from
+  /// there too, so refresh local state on return.
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const HistoryScreen()),
+    );
+    await _loadFavorites();
+  }
+
   /// Opens the weather location settings. A location change doesn't
   /// reroll anything already picked today (that would be jarring) — it
   /// just refreshes the label shown in the UI and takes effect on the
@@ -186,6 +225,19 @@ class _HomeScreenState extends State<HomeScreen>
   /// silently the moment the tab is opened.
   bool get _isEveningUnlocked => DateTime.now().hour >= 17;
 
+  /// Called on every tab-controller change (fires while the swipe/tap
+  /// animation is in flight, then again once it settles). We only act
+  /// once it settles on the Evening tab, since that's the first
+  /// reliable point to say "the user is actually looking at Evening
+  /// now" — the right moment to fetch a fresh weather reading and pick
+  /// evening's reflection if it hasn't been picked yet today.
+  void _onTabChanged() {
+    if (_tabController.indexIsChanging) return;
+    if (_tabController.index == 2 && _isEveningUnlocked && _evening == null) {
+      _pickEveningReflection();
+    }
+  }
+
   /// Fetches current weather (online) or falls back to the last cached
   /// reading (offline) via WeatherService, mapping it to one of the
   /// 'weather_*' context ids. Also updates [_weatherSnapshot] so the UI
@@ -200,17 +252,73 @@ class _HomeScreenState extends State<HomeScreen>
     return snapshot?.conditionId;
   }
 
-  /// Picks (or loads today's already-picked) morning and evening
-  /// reflections. No mood check-in involved — these are ambient, not
-  /// asked-for.
+  /// Picks (or loads today's already-picked) morning reflection using a
+  /// weather reading fetched right now. Evening is handled separately
+  /// by [_loadOrDeferEvening] so it doesn't share morning's (possibly
+  /// hours-stale-by-evening) weather snapshot.
   Future<void> _loadAmbientReflections() async {
     final weatherId = await _currentWeatherId();
+    _morningWeatherId = weatherId;
 
     final morning = await _dailyService.getSlotReflection(
       slot: ReflectionSlot.morning,
       weatherId: weatherId,
       timeId: 'time_morning',
     );
+
+    if (!mounted) return;
+    setState(() {
+      _morning = morning;
+      _loadingAmbient = false;
+    });
+
+    await _loadOrDeferEvening();
+
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (mounted) _fadeController.forward();
+
+    _scheduleTomorrowNotification();
+  }
+
+  /// Loads today's evening reflection if it's already been picked
+  /// earlier (e.g. reopening the app later the same evening), picks it
+  /// fresh right now if the app happened to be opened after 5pm and
+  /// nothing's assigned yet for today, or otherwise leaves it unpicked
+  /// so [_onTabChanged] can pick it — with a weather reading fetched at
+  /// that moment — the first time the Evening tab is actually viewed
+  /// after unlock.
+  Future<void> _loadOrDeferEvening() async {
+    final existingEvening =
+        await _dailyService.getSlotIfAssigned(ReflectionSlot.evening);
+    if (!mounted) return;
+
+    if (existingEvening != null) {
+      setState(() {
+        _evening = existingEvening;
+        _loadingEvening = false;
+      });
+    } else if (_isEveningUnlocked) {
+      // App was opened after 5pm and evening hasn't been picked yet
+      // today -- pick it now, with its own fresh weather reading.
+      await _pickEveningReflection();
+    } else {
+      // Not evening yet -- nothing to load; AmbientTab will show the
+      // locked placeholder until 5pm.
+      setState(() => _loadingEvening = false);
+    }
+  }
+
+  /// Fetches a fresh weather reading and picks (or loads, if some other
+  /// caller beat us to it) today's evening reflection. Safe to call
+  /// more than once -- the early return means only the first caller
+  /// (whichever of [_loadOrDeferEvening] or [_onTabChanged] gets there
+  /// first) actually does the work.
+  Future<void> _pickEveningReflection() async {
+    if (_evening != null) return;
+
+    setState(() => _loadingEvening = true);
+    final weatherId = await _currentWeatherId();
+    _eveningWeatherId = weatherId;
     final evening = await _dailyService.getSlotReflection(
       slot: ReflectionSlot.evening,
       weatherId: weatherId,
@@ -219,15 +327,9 @@ class _HomeScreenState extends State<HomeScreen>
 
     if (!mounted) return;
     setState(() {
-      _morning = morning;
       _evening = evening;
-      _loadingAmbient = false;
+      _loadingEvening = false;
     });
-
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (mounted) _fadeController.forward();
-
-    _scheduleTomorrowNotification();
   }
 
   /// If the on-demand slot was already picked earlier today (e.g.
@@ -273,13 +375,48 @@ class _HomeScreenState extends State<HomeScreen>
     });
   }
 
-  Future<void> _enterExplore() async {
-    final all = await _embeddingService.allReflections();
-    final shuffled = List<EmbeddedReflection>.from(all)..shuffle();
+  /// Enters Explore mode. When [contextTimeId] is given (i.e. entering
+  /// from the Morning or Evening tab), the pool is ranked against the
+  /// same weather+time context vector that picked the reflection
+  /// currently shown on that tab -- so swiping through Explore feels
+  /// like a continuation of that same ambient "mood" instead of
+  /// jumping to something tonally random. The top matches are taken as
+  /// a pool and shuffled *within* that pool, so it's not a rigidly
+  /// identical ranked list every time, just a similar-vibe one.
+  ///
+  /// [contextTimeId] is omitted only if Explore is ever entered without
+  /// a specific ambient tab in mind, in which case it falls back to a
+  /// fully random shuffle over everything (the old behavior).
+  Future<void> _enterExplore({
+    String? contextTimeId,
+    String? contextWeatherId,
+  }) async {
+    List<EmbeddedReflection> pool;
+
+    if (contextTimeId != null) {
+      final contextVector = await _embeddingService.buildContextVector(
+        weatherId: contextWeatherId,
+        timeId: contextTimeId,
+      );
+      // Don't show the reflection that's already on-screen for this
+      // slot as one of the "other" ones.
+      final currentId =
+          contextTimeId == 'time_morning' ? _morning?.id : _evening?.id;
+      final ranked = await _embeddingService.rank(
+        contextVector,
+        excludeIds: {if (currentId != null) currentId},
+      );
+      final poolSize = min(12, ranked.length);
+      pool = ranked.take(poolSize).map((s) => s.reflection).toList()
+        ..shuffle();
+    } else {
+      final all = await _embeddingService.allReflections();
+      pool = List<EmbeddedReflection>.from(all)..shuffle();
+    }
 
     if (!mounted) return;
     setState(() {
-      _explorePool = shuffled;
+      _explorePool = pool;
       _exploring = true;
       _currentExploreIndex = 0;
       _readIndices.clear();
@@ -311,9 +448,10 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _openBrowse() {
-    // NOTE: still browses the legacy tagged Quote pool, not the
-    // embedded reflections — same pre-existing gap as before, not
-    // something this change touches.
+    // BrowseScreen already reads from the embedded reflections
+    // (assets/reflections.json via ReflectionEmbeddingService), not the
+    // old tagged Quote model -- that migration already happened, this
+    // comment used to say otherwise and was just stale.
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const BrowseScreen()),
     );
@@ -321,6 +459,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void dispose() {
+    _tabController.removeListener(_onTabChanged);
     _tabController.dispose();
     _fadeController.dispose();
     _readController.dispose();
@@ -362,6 +501,11 @@ class _HomeScreenState extends State<HomeScreen>
             onPressed: _openFavorites,
           ),
           IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'History',
+            onPressed: _openHistory,
+          ),
+          IconButton(
             icon: const Icon(Icons.menu_book_outlined),
             tooltip: 'Browse all quotes',
             onPressed: _openBrowse,
@@ -400,7 +544,10 @@ class _HomeScreenState extends State<HomeScreen>
           fadeAnimation: _fadeAnimation,
           favoriteIds: _favoriteIds,
           onToggleFavorite: _toggleFavorite,
-          onExplore: _enterExplore,
+          onExplore: () => _enterExplore(
+            contextTimeId: 'time_morning',
+            contextWeatherId: _morningWeatherId,
+          ),
         ),
         OnDemandTab(
           reflection: _onDemand,
@@ -411,7 +558,7 @@ class _HomeScreenState extends State<HomeScreen>
         ),
         AmbientTab(
           reflection: _evening,
-          loading: _loadingAmbient,
+          loading: _loadingEvening,
           unlocked: _isEveningUnlocked,
           lockedLabel: 'evening',
           lockedHint: 'Come back after 5:00 PM',
@@ -419,7 +566,10 @@ class _HomeScreenState extends State<HomeScreen>
           fadeAnimation: _fadeAnimation,
           favoriteIds: _favoriteIds,
           onToggleFavorite: _toggleFavorite,
-          onExplore: _enterExplore,
+          onExplore: () => _enterExplore(
+            contextTimeId: 'time_evening',
+            contextWeatherId: _eveningWeatherId,
+          ),
         ),
       ],
     );

@@ -26,6 +26,24 @@ extension ReflectionSlotKey on ReflectionSlot {
       };
 }
 
+/// A single day's ambient "headline" picks -- Morning and/or Evening,
+/// whichever have been assigned so far for that date. Deliberately
+/// excludes the on-demand/check-in slot: that one can be rerolled
+/// repeatedly in a single day via "Something else", so unlike the
+/// ambient slots it doesn't represent one stable daily pick worth
+/// calling a "headline". See [ReflectionDailyService.getDailyHeadlines].
+class DailyHeadline {
+  final String date; // yyyy-MM-dd
+  final String? morningId;
+  final String? eveningId;
+
+  const DailyHeadline({
+    required this.date,
+    required this.morningId,
+    required this.eveningId,
+  });
+}
+
 /// Picks and persists reflections for up to three daily "slots" —
 /// morning, evening, and an on-demand mood-driven pick — replacing the
 /// old single "today's reflection" model.
@@ -195,6 +213,31 @@ class ReflectionDailyService {
     return existing.isNotEmpty ? existing.first : null;
   }
 
+  /// Every date's ambient (Morning/Evening) picks, most recent first --
+  /// each date deduplicated to at most one id per slot, since that's
+  /// exactly what the assignment map already stores (rerolls of the
+  /// on-demand slot overwrite in place rather than piling up, but this
+  /// method skips on-demand entirely regardless -- see [DailyHeadline]).
+  /// Dates where neither ambient slot was ever assigned are omitted.
+  Future<List<DailyHeadline>> getDailyHeadlines() async {
+    final prefs = await SharedPreferences.getInstance();
+    final assignedMap = await _getAssignedMap(prefs);
+
+    final dates = assignedMap.keys.toList()..sort((a, b) => b.compareTo(a));
+
+    return dates
+        .map((date) {
+          final slots = assignedMap[date] ?? const {};
+          return DailyHeadline(
+            date: date,
+            morningId: slots[ReflectionSlot.morning.storageKey],
+            eveningId: slots[ReflectionSlot.evening.storageKey],
+          );
+        })
+        .where((h) => h.morningId != null || h.eveningId != null)
+        .toList();
+  }
+
   // ---------------------------------------------------------------------
   // Storage helpers
   // ---------------------------------------------------------------------
@@ -264,8 +307,11 @@ class ReflectionDailyService {
     return recent;
   }
 
-  /// Full shown-reflection history, most recent first. Useful for an
-  /// archive screen; each entry now also carries which slot showed it.
+  /// Full shown-reflection history, most recent first. Each entry
+  /// carries which slot showed it. Note this includes every reroll of
+  /// the on-demand slot as a separate entry (that's what recency
+  /// exclusion needs) -- for a deduplicated "one pick per day" view,
+  /// use [getDailyHeadlines] instead.
   Future<List<Map<String, String>>> getHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final history = await _getHistory(prefs);
