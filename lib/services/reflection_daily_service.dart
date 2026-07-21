@@ -196,34 +196,6 @@ class ReflectionDailyService {
   }
 
   // ---------------------------------------------------------------------
-  // Deprecated single-slot API — kept so existing callers (HomeScreen)
-  // keep compiling. Maps the old "today's reflection" concept onto the
-  // on-demand slot, since that was always the mood-driven one. Remove
-  // once HomeScreen is updated to call the slot API directly.
-  // ---------------------------------------------------------------------
-
-  @Deprecated(
-      'Use getSlotReflection(slot: ReflectionSlot.onDemand, ...) instead')
-  Future<EmbeddedReflection> getTodaysReflection({
-    required String moodId,
-    String? weatherId,
-  }) {
-    return getSlotReflection(
-      slot: ReflectionSlot.onDemand,
-      moodId: moodId,
-      weatherId: weatherId,
-    );
-  }
-
-  @Deprecated('Use hasSlotAssignment(ReflectionSlot.onDemand) instead')
-  Future<bool> hasTodaysAssignment() =>
-      hasSlotAssignment(ReflectionSlot.onDemand);
-
-  @Deprecated('Use getSlotIfAssigned(ReflectionSlot.onDemand) instead')
-  Future<EmbeddedReflection?> getTodaysReflectionIfAssigned() =>
-      getSlotIfAssigned(ReflectionSlot.onDemand);
-
-  // ---------------------------------------------------------------------
   // Storage helpers
   // ---------------------------------------------------------------------
 
