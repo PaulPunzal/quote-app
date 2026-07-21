@@ -6,7 +6,6 @@ import '../services/reflection_embedding_service.dart';
 import '../services/notification_service.dart';
 import '../widgets/mood_check_in_sheet.dart';
 import 'browse_screen.dart';
-import 'add_quote_screen.dart';
 
 /// The main screen — shows today's reflection, fading in slowly.
 ///
@@ -202,17 +201,6 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Future<void> _openAddQuote() async {
-    // NOTE: still points at the legacy tag-based Add/Bulk Import flow.
-    // Those screens add to the old Quote pool, which is separate from
-    // the embedded reflection pool used here -- worth deciding
-    // deliberately whether/how user-added entries join the smart
-    // recommender (see earlier discussion: they have no embedding).
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const AddQuoteScreen()),
-    );
-  }
-
   void _openBrowse() {
     // NOTE: still browses the legacy tagged Quote pool, not the
     // embedded reflections. Revisit once Browse is updated to read
@@ -244,11 +232,6 @@ class _HomeScreenState extends State<HomeScreen>
             icon: const Icon(Icons.menu_book_outlined),
             tooltip: 'Browse all quotes',
             onPressed: _openBrowse,
-          ),
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: 'Add a quote',
-            onPressed: _openAddQuote,
           ),
         ],
       ),
