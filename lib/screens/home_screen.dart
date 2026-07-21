@@ -5,9 +5,11 @@ import '../services/reflection_daily_service.dart';
 import '../services/reflection_embedding_service.dart';
 import '../services/notification_service.dart';
 import '../services/favorites_service.dart';
+import '../services/weather_service.dart';
 import '../widgets/mood_check_in_sheet.dart';
 import 'browse_screen.dart';
 import 'favorites_screen.dart';
+import 'weather_location_screen.dart';
 
 /// The main screen — three tabs:
 ///   - Morning / Evening: ambient picks, auto-assigned on load from
@@ -36,6 +38,7 @@ class _HomeScreenState extends State<HomeScreen>
       ReflectionEmbeddingService();
   final NotificationService _notifications = NotificationService();
   final FavoritesService _favoritesService = FavoritesService();
+  final WeatherService _weatherService = WeatherService();
 
   late final TabController _tabController;
 
@@ -47,6 +50,12 @@ class _HomeScreenState extends State<HomeScreen>
   bool _onDemandLoading = false;
 
   Set<String> _favoriteIds = {};
+
+  /// Most recent weather reading, kept around purely for the small
+  /// "Rainy, 24°C in ..." label in the UI — the *matching* itself reads
+  /// straight from SharedPreferences via WeatherService each time a
+  /// slot is picked, so this field never gates anything.
+  WeatherSnapshot? _weatherSnapshot;
 
   late final AnimationController _fadeController;
   late final Animation<double> _fadeAnimation;
@@ -137,6 +146,22 @@ class _HomeScreenState extends State<HomeScreen>
     await _loadFavorites();
   }
 
+  /// Opens the weather location settings. A location change doesn't
+  /// reroll anything already picked today (that would be jarring) — it
+  /// just refreshes the label shown in the UI and takes effect on the
+  /// next slot pick (tomorrow's ambient picks, or the next check-in).
+  Future<void> _openWeatherSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const WeatherLocationScreen()),
+    );
+    await _refreshWeatherSnapshot();
+  }
+
+  Future<void> _refreshWeatherSnapshot() async {
+    final snapshot = await _weatherService.currentSnapshot();
+    if (mounted) setState(() => _weatherSnapshot = snapshot);
+  }
+
   int _initialTabIndex() {
     final hour = DateTime.now().hour;
     if (hour < 5) return 1; // both ambient tabs locked — land on Check In
@@ -153,12 +178,18 @@ class _HomeScreenState extends State<HomeScreen>
   /// silently the moment the tab is opened.
   bool get _isEveningUnlocked => DateTime.now().hour >= 17;
 
-  /// TODO(weather): stubbed for now — always returns null, so matching
-  /// runs on time (and, for the check-in tab, mood) only. Once a
-  /// weather source is wired in, map its condition to one of the
-  /// 'weather_*' ids from context_options.json and return that instead.
+  /// Fetches current weather (online) or falls back to the last cached
+  /// reading (offline) via WeatherService, mapping it to one of the
+  /// 'weather_*' context ids. Also updates [_weatherSnapshot] so the UI
+  /// can show what conditions actually informed the pick. Returns null
+  /// if no location has been configured yet, or if there's neither a
+  /// fresh reading nor a cached one to fall back to — matching runs on
+  /// time (and mood, for the check-in tab) alone in that case, same as
+  /// before this feature existed.
   Future<String?> _currentWeatherId() async {
-    return null;
+    final snapshot = await _weatherService.currentSnapshot();
+    if (mounted) setState(() => _weatherSnapshot = snapshot);
+    return snapshot?.conditionId;
   }
 
   /// Picks (or loads today's already-picked) morning and evening
@@ -313,6 +344,11 @@ class _HomeScreenState extends State<HomeScreen>
               ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.location_on_outlined),
+            tooltip: 'Weather location',
+            onPressed: _openWeatherSettings,
+          ),
+          IconButton(
             icon: const Icon(Icons.favorite_border),
             tooltip: 'Favorites',
             onPressed: _openFavorites,
@@ -325,9 +361,34 @@ class _HomeScreenState extends State<HomeScreen>
         ],
       ),
       body: SafeArea(
-        child: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 300),
-          child: _exploring ? _buildExploreView() : _buildTabs(),
+        child: Column(
+          children: [
+            if (!_exploring && _weatherSnapshot != null) _buildWeatherStrip(),
+            Expanded(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 300),
+                child: _exploring ? _buildExploreView() : _buildTabs(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWeatherStrip() {
+    final snapshot = _weatherSnapshot!;
+    final tempPart =
+        snapshot.tempC != null ? '${snapshot.tempC!.round()}\u00B0C, ' : '';
+    final stalePart = snapshot.isFromCache ? ' \u00B7 last known' : '';
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          '$tempPart${snapshot.conditionLabel} in ${snapshot.locationLabel}$stalePart',
+          style: const TextStyle(fontSize: 11, color: Color(0xFF8A6F5C)),
         ),
       ),
     );
