@@ -4,21 +4,23 @@ import '../models/embedded_reflection.dart';
 import '../services/reflection_daily_service.dart';
 import '../services/reflection_embedding_service.dart';
 import '../services/notification_service.dart';
+import '../services/favorites_service.dart';
 import '../widgets/mood_check_in_sheet.dart';
 import 'browse_screen.dart';
 
-/// The main screen — shows today's reflection, fading in slowly.
+/// The main screen — three tabs:
+///   - Morning / Evening: ambient picks, auto-assigned on load from
+///     weather + a fixed time-of-day context (not the current clock —
+///     see ReflectionDailyService.getSlotReflection's `timeId` doc).
+///     Fixed for the day once picked, same as the old single-reflection
+///     behavior.
+///   - Check in: the old mood-check-in flow, now explicitly triggered
+///     by a button rather than blocking the screen on load. Supports
+///     "Something else" to re-roll (re-asking mood) instead of being
+///     stuck with one pick for the whole day.
 ///
-/// Picking is now handled by ReflectionDailyService: mood comes from a
-/// quick check-in sheet, weather is stubbed out for now (see
-/// _currentWeatherId below), and time-of-day is computed automatically
-/// from the clock. Once picked, today's reflection stays fixed for the
-/// rest of the day, same as the old quote system.
-///
-/// Explore mode below still works the same way conceptually — a
-/// shuffled feed of other reflections you can swipe through — but now
-/// pulls from the embedded reflection pool instead of the old tagged
-/// quote pool.
+/// Explore mode (shuffle through everything) is unchanged conceptually,
+/// just reachable from any tab instead of being tied to one reflection.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -32,14 +34,23 @@ class _HomeScreenState extends State<HomeScreen>
   final ReflectionEmbeddingService _embeddingService =
       ReflectionEmbeddingService();
   final NotificationService _notifications = NotificationService();
+  final FavoritesService _favoritesService = FavoritesService();
 
-  EmbeddedReflection? _reflection;
-  bool _loading = true;
+  late final TabController _tabController;
+
+  EmbeddedReflection? _morning;
+  EmbeddedReflection? _evening;
+  EmbeddedReflection? _onDemand;
+
+  bool _loadingAmbient = true;
+  bool _onDemandLoading = false;
+
+  Set<String> _favoriteIds = {};
 
   late final AnimationController _fadeController;
   late final Animation<double> _fadeAnimation;
 
-  // --- Explore mode state ---
+  // --- Explore mode state (unchanged from before) ---
   bool _exploring = false;
   final PageController _pageController = PageController();
   List<EmbeddedReflection> _explorePool = [];
@@ -65,6 +76,16 @@ class _HomeScreenState extends State<HomeScreen>
   void initState() {
     super.initState();
 
+    // Default tab follows the clock so the app still feels timely on
+    // open. Before 5am neither ambient tab is unlocked yet (see
+    // _isMorningUnlocked/_isEveningUnlocked below), so land on Check In
+    // instead of a locked tab.
+    _tabController = TabController(
+      length: 3,
+      vsync: this,
+      initialIndex: _initialTabIndex(),
+    );
+
     _fadeController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 4),
@@ -86,48 +107,70 @@ class _HomeScreenState extends State<HomeScreen>
         }
       });
 
-    _loadReflection();
+    _loadAmbientReflections();
+    _loadExistingOnDemand();
+    _loadFavorites();
   }
 
+  Future<void> _loadFavorites() async {
+    final ids = await _favoritesService.getAll();
+    if (mounted) setState(() => _favoriteIds = ids);
+  }
+
+  /// Flips [id]'s favorited state and updates local state so every tab
+  /// showing that reflection re-renders its heart immediately.
+  Future<void> _toggleFavorite(String id) async {
+    final updated = await _favoritesService.toggle(id);
+    if (!mounted) return;
+    setState(() => _favoriteIds = updated);
+  }
+
+  int _initialTabIndex() {
+    final hour = DateTime.now().hour;
+    if (hour < 5) return 1; // both ambient tabs locked — land on Check In
+    return hour < 17 ? 0 : 2;
+  }
+
+  /// Morning unlocks at 5am and stays visible the rest of the day —
+  /// once morning has actually happened there's nothing left to spoil.
+  bool get _isMorningUnlocked => DateTime.now().hour >= 5;
+
+  /// Evening unlocks at 5pm, same reasoning. Both flip back to locked
+  /// at midnight because a fresh date means a fresh (not-yet-picked-
+  /// for-real) slot, even though the reflection itself is pre-picked
+  /// silently the moment the tab is opened.
+  bool get _isEveningUnlocked => DateTime.now().hour >= 17;
+
   /// TODO(weather): stubbed for now — always returns null, so matching
-  /// runs on mood + time only. Once a weather source is wired in, map
-  /// its condition to one of the 'weather_*' ids from
-  /// context_options.json and return that instead.
+  /// runs on time (and, for the check-in tab, mood) only. Once a
+  /// weather source is wired in, map its condition to one of the
+  /// 'weather_*' ids from context_options.json and return that instead.
   Future<String?> _currentWeatherId() async {
     return null;
   }
 
-  Future<void> _loadReflection() async {
-    // If today's reflection was already picked (e.g. reopening the app
-    // later the same day), just show it — no need to ask mood again.
-    final alreadyPicked = await _dailyService.getTodaysReflectionIfAssigned();
+  /// Picks (or loads today's already-picked) morning and evening
+  /// reflections. No mood check-in involved — these are ambient, not
+  /// asked-for.
+  Future<void> _loadAmbientReflections() async {
+    final weatherId = await _currentWeatherId();
 
-    EmbeddedReflection reflection;
-    if (alreadyPicked != null) {
-      reflection = alreadyPicked;
-    } else {
-      if (!mounted) return;
-      final moodId = await MoodCheckInSheet.show(context);
-
-      if (moodId == null) {
-        // Sheet was dismissed without a choice. isDismissible is false
-        // on the sheet itself, so this path is mostly a safety net --
-        // still, don't leave the screen stuck loading forever.
-        if (mounted) setState(() => _loading = false);
-        return;
-      }
-
-      final weatherId = await _currentWeatherId();
-      reflection = await _dailyService.getTodaysReflection(
-        moodId: moodId,
-        weatherId: weatherId,
-      );
-    }
+    final morning = await _dailyService.getSlotReflection(
+      slot: ReflectionSlot.morning,
+      weatherId: weatherId,
+      timeId: 'time_morning',
+    );
+    final evening = await _dailyService.getSlotReflection(
+      slot: ReflectionSlot.evening,
+      weatherId: weatherId,
+      timeId: 'time_evening',
+    );
 
     if (!mounted) return;
     setState(() {
-      _reflection = reflection;
-      _loading = false;
+      _morning = morning;
+      _evening = evening;
+      _loadingAmbient = false;
     });
 
     await Future.delayed(const Duration(milliseconds: 400));
@@ -136,18 +179,47 @@ class _HomeScreenState extends State<HomeScreen>
     _scheduleTomorrowNotification();
   }
 
-  /// See the class-level note: tomorrow's *specific* reflection can't
-  /// be pre-picked, because picking depends on tomorrow's mood, which
-  /// isn't known yet. Rather than guess (and risk showing a mismatched
-  /// reflection in the notification body, or reusing today's), this
-  /// schedules a generic, non-spoiling reminder instead. Revisit this
-  /// once there's a plan for mood-independent notification content.
+  /// If the on-demand slot was already picked earlier today (e.g.
+  /// reopening the app), show it without prompting for mood again.
+  Future<void> _loadExistingOnDemand() async {
+    final existing =
+        await _dailyService.getSlotIfAssigned(ReflectionSlot.onDemand);
+    if (existing != null && mounted) {
+      setState(() => _onDemand = existing);
+    }
+  }
+
   Future<void> _scheduleTomorrowNotification() async {
     await _notifications.init();
     await _notifications.scheduleTomorrowGeneric(
       hour: 8,
       minute: 0,
     );
+  }
+
+  /// Shows the mood check-in sheet and (re-)picks the on-demand
+  /// reflection. Always force-rerolls: on first check-in today the
+  /// cache is empty anyway, and on a repeat check-in ("Something
+  /// else") the person's mood may have changed, so re-asking and
+  /// always picking fresh is simpler and more honest than reusing a
+  /// stale answer.
+  Future<void> _checkIn() async {
+    final moodId = await MoodCheckInSheet.show(context);
+    if (moodId == null) return; // sheet dismissed without a choice
+
+    setState(() => _onDemandLoading = true);
+    final weatherId = await _currentWeatherId();
+    final reflection = await _dailyService.rerollSlot(
+      slot: ReflectionSlot.onDemand,
+      moodId: moodId,
+      weatherId: weatherId,
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _onDemand = reflection;
+      _onDemandLoading = false;
+    });
   }
 
   Future<void> _enterExplore() async {
@@ -187,24 +259,10 @@ class _HomeScreenState extends State<HomeScreen>
       ..forward();
   }
 
-  void _showNextExploreQuote() {
-    if (!_canAdvance || _explorePool.length < 2) return;
-
-    final current =
-        _pageController.hasClients ? (_pageController.page ?? 0).round() : 0;
-    final next = (current + 1) % _explorePool.length;
-
-    _pageController.animateToPage(
-      next,
-      duration: const Duration(milliseconds: 350),
-      curve: Curves.easeInOut,
-    );
-  }
-
   void _openBrowse() {
     // NOTE: still browses the legacy tagged Quote pool, not the
-    // embedded reflections. Revisit once Browse is updated to read
-    // from reflections.json.
+    // embedded reflections — same pre-existing gap as before, not
+    // something this change touches.
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const BrowseScreen()),
     );
@@ -212,6 +270,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   @override
   void dispose() {
+    _tabController.dispose();
     _fadeController.dispose();
     _readController.dispose();
     _pageController.dispose();
@@ -227,6 +286,19 @@ class _HomeScreenState extends State<HomeScreen>
         foregroundColor: const Color(0xFF3B2E28),
         elevation: 0,
         title: const Text('Daily Reflection'),
+        bottom: _exploring
+            ? null
+            : TabBar(
+                controller: _tabController,
+                labelColor: const Color(0xFF3B2E28),
+                unselectedLabelColor: const Color(0xFF8A6F5C),
+                indicatorColor: const Color(0xFFB5651D),
+                tabs: const [
+                  Tab(text: 'Morning'),
+                  Tab(text: 'Check in'),
+                  Tab(text: 'Evening'),
+                ],
+              ),
         actions: [
           IconButton(
             icon: const Icon(Icons.menu_book_outlined),
@@ -238,19 +310,56 @@ class _HomeScreenState extends State<HomeScreen>
       body: SafeArea(
         child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 300),
-          child: _exploring ? _buildExploreView() : _buildTodayView(),
+          child: _exploring ? _buildExploreView() : _buildTabs(),
         ),
       ),
     );
   }
 
-  Widget _buildTodayView() {
-    if (_loading || _reflection == null) {
-      return const Center(key: ValueKey('today'), child: _QuietLoadingDot());
+  Widget _buildTabs() {
+    return TabBarView(
+      key: const ValueKey('tabs'),
+      controller: _tabController,
+      children: [
+        _buildAmbientTab(
+          _morning,
+          unlocked: _isMorningUnlocked,
+          lockedLabel: 'morning',
+          lockedHint: 'Come back after 5:00 AM',
+          lockedIcon: Icons.wb_twilight,
+        ),
+        _buildOnDemandTab(),
+        _buildAmbientTab(
+          _evening,
+          unlocked: _isEveningUnlocked,
+          lockedLabel: 'evening',
+          lockedHint: 'Come back after 5:00 PM',
+          lockedIcon: Icons.nights_stay_outlined,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAmbientTab(
+    EmbeddedReflection? reflection, {
+    required bool unlocked,
+    required String lockedLabel,
+    required String lockedHint,
+    required IconData lockedIcon,
+  }) {
+    if (_loadingAmbient || reflection == null) {
+      return const Center(child: _QuietLoadingDot());
+    }
+
+    if (!unlocked) {
+      return _buildLockedPlaceholder(
+        label: lockedLabel,
+        hint: lockedHint,
+        icon: lockedIcon,
+      );
     }
 
     return Column(
-      key: const ValueKey('today'),
       children: [
         Expanded(
           child: Center(
@@ -258,16 +367,11 @@ class _HomeScreenState extends State<HomeScreen>
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: FadeTransition(
                 opacity: _fadeAnimation,
-                child: Text(
-                  _reflection!.text,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 22,
-                    fontStyle: FontStyle.italic,
-                    height: 1.5,
-                    color: Color(0xFF3B2E28),
-                    fontFamily: 'Georgia',
-                  ),
+                child: _FavoritableReflection(
+                  reflectionId: reflection.id,
+                  text: reflection.text,
+                  isFavorite: _favoriteIds.contains(reflection.id),
+                  onToggleFavorite: _toggleFavorite,
                 ),
               ),
             ),
@@ -288,41 +392,143 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  Widget _buildLockedPlaceholder({
+    required String label,
+    required String hint,
+    required IconData icon,
+  }) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 28, color: const Color(0xFFD8C3AE)),
+            const SizedBox(height: 16),
+            Text(
+              'Your $label reflection is waiting',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 15,
+                fontStyle: FontStyle.italic,
+                fontFamily: 'Georgia',
+                color: Color(0xFF3B2E28),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              hint,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Color(0xFF8A6F5C)),
+            ),
+            const SizedBox(height: 20),
+            TextButton(
+              onPressed: _enterExplore,
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF8A6F5C),
+              ),
+              child: const Text('Explore reflections instead'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOnDemandTab() {
+    if (_onDemandLoading) {
+      return const Center(child: _QuietLoadingDot());
+    }
+
+    if (_onDemand == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 40),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'A reflection picked for how you\'re feeling right now.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Color(0xFF8A6F5C),
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 20),
+              FilledButton(
+                onPressed: _checkIn,
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFB5651D),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Text('Check in with yourself'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      children: [
+        Expanded(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: _FavoritableReflection(
+                reflectionId: _onDemand!.id,
+                text: _onDemand!.text,
+                isFavorite: _favoriteIds.contains(_onDemand!.id),
+                onToggleFavorite: _toggleFavorite,
+              ),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 32),
+          child: TextButton(
+            onPressed: _checkIn,
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF8A6F5C),
+            ),
+            child: const Text('Something else'),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildExploreView() {
     return Column(
       key: const ValueKey('explore'),
       children: [
-        if (_reflection != null)
-          _MinimizedTodayReflection(
-            reflection: _reflection!,
-            onTap: _exitExplore,
-          ),
         Expanded(
           child: _explorePool.isEmpty
               ? const Center(child: Text('No other reflections yet.'))
               : PageView.builder(
                   controller: _pageController,
                   onPageChanged: _startReadCooldown,
+                  physics: _canAdvance
+                      ? const PageScrollPhysics()
+                      : const NeverScrollableScrollPhysics(),
                   itemCount: _explorePool.length,
                   itemBuilder: (context, index) {
                     final r = _explorePool[index];
-                    return GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: _showNextExploreQuote,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 32),
-                        child: Center(
-                          child: Text(
-                            r.text,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(
-                              fontSize: 20,
-                              fontStyle: FontStyle.italic,
-                              height: 1.5,
-                              color: Color(0xFF3B2E28),
-                              fontFamily: 'Georgia',
-                            ),
-                          ),
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 32),
+                      child: Center(
+                        child: _FavoritableReflection(
+                          reflectionId: r.id,
+                          text: r.text,
+                          fontSize: 20,
+                          isFavorite: _favoriteIds.contains(r.id),
+                          onToggleFavorite: _toggleFavorite,
                         ),
                       ),
                     );
@@ -349,8 +555,18 @@ class _HomeScreenState extends State<HomeScreen>
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 12),
           child: Text(
-            _canAdvance ? 'Swipe or tap for another' : 'Take a moment…',
+            _canAdvance ? 'Swipe for another' : 'Take a moment…',
             style: const TextStyle(fontSize: 11, color: Color(0xFF8A6F5C)),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: TextButton(
+            onPressed: _exitExplore,
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF8A6F5C),
+            ),
+            child: const Text('Back to today'),
           ),
         ),
       ],
@@ -358,47 +574,138 @@ class _HomeScreenState extends State<HomeScreen>
   }
 }
 
-class _MinimizedTodayReflection extends StatelessWidget {
-  final EmbeddedReflection reflection;
-  final VoidCallback onTap;
+/// Displays a reflection with a heart button and double-tap-to-favorite.
+/// Used everywhere a reflection is shown — ambient tabs, on-demand, and
+/// Explore — so favoriting works the same regardless of where you found
+/// the reflection.
+class _FavoritableReflection extends StatefulWidget {
+  final String reflectionId;
+  final String text;
+  final double fontSize;
+  final bool isFavorite;
+  final ValueChanged<String> onToggleFavorite;
 
-  const _MinimizedTodayReflection({
-    required this.reflection,
-    required this.onTap,
+  const _FavoritableReflection({
+    required this.reflectionId,
+    required this.text,
+    required this.isFavorite,
+    required this.onToggleFavorite,
+    this.fontSize = 22,
   });
 
   @override
+  State<_FavoritableReflection> createState() =>
+      _FavoritableReflectionState();
+}
+
+class _FavoritableReflectionState extends State<_FavoritableReflection>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _popController;
+  late final Animation<double> _popScale;
+  late final Animation<double> _popOpacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _popController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 550),
+    );
+    _popScale = TweenSequence([
+      TweenSequenceItem(
+        tween: Tween(begin: 0.5, end: 1.15)
+            .chain(CurveTween(curve: Curves.easeOut)),
+        weight: 45,
+      ),
+      TweenSequenceItem(
+        tween: Tween(begin: 1.15, end: 1.0)
+            .chain(CurveTween(curve: Curves.easeIn)),
+        weight: 55,
+      ),
+    ]).animate(_popController);
+    _popOpacity = TweenSequence([
+      TweenSequenceItem(tween: Tween(begin: 0.0, end: 1.0), weight: 15),
+      TweenSequenceItem(tween: ConstantTween(1.0), weight: 45),
+      TweenSequenceItem(tween: Tween(begin: 1.0, end: 0.0), weight: 40),
+    ]).animate(_popController);
+  }
+
+  @override
+  void dispose() {
+    _popController.dispose();
+    super.dispose();
+  }
+
+  void _handleDoubleTap() {
+    final wasFavorite = widget.isFavorite;
+    widget.onToggleFavorite(widget.reflectionId);
+    // Only pop the big heart when *becoming* favorited — double-tapping
+    // an already-favorited one to remove it doesn't need the flourish.
+    if (!wasFavorite) {
+      _popController.forward(from: 0);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Container(
-        margin: const EdgeInsets.fromLTRB(20, 8, 20, 4),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        decoration: BoxDecoration(
-          color: const Color(0xFFF0E4D4),
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.today, size: 16, color: Color(0xFF8A6F5C)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                reflection.text,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 12,
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onDoubleTap: _handleDoubleTap,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                widget.text,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: widget.fontSize,
                   fontStyle: FontStyle.italic,
-                  color: Color(0xFF3B2E28),
+                  height: 1.5,
+                  color: const Color(0xFF3B2E28),
+                  fontFamily: 'Georgia',
                 ),
               ),
+              const SizedBox(height: 18),
+              IconButton(
+                onPressed: () =>
+                    widget.onToggleFavorite(widget.reflectionId),
+                icon: Icon(
+                  widget.isFavorite ? Icons.favorite : Icons.favorite_border,
+                  color: widget.isFavorite
+                      ? const Color(0xFFB5651D)
+                      : const Color(0xFF8A6F5C),
+                ),
+                tooltip: widget.isFavorite
+                    ? 'Remove from favorites'
+                    : 'Add to favorites',
+              ),
+            ],
+          ),
+          IgnorePointer(
+            child: AnimatedBuilder(
+              animation: _popController,
+              builder: (context, _) {
+                if (_popController.isDismissed) {
+                  return const SizedBox.shrink();
+                }
+                return Opacity(
+                  opacity: _popOpacity.value,
+                  child: Transform.scale(
+                    scale: _popScale.value,
+                    child: const Icon(
+                      Icons.favorite,
+                      size: 72,
+                      color: Color(0xFFB5651D),
+                    ),
+                  ),
+                );
+              },
             ),
-            const SizedBox(width: 8),
-            const Icon(Icons.close, size: 16, color: Color(0xFF8A6F5C)),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
