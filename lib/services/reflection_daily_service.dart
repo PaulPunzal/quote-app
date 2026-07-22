@@ -7,15 +7,9 @@ import '../models/embedded_reflection.dart';
 /// Which "moment" a reflection is being picked for.
 ///
 /// - [morning] / [evening]: ambient, auto-picked from weather + time only
-///   (no mood check-in). Fixed once assigned for the day, same as the old
-///   single-reflection behavior — reopening the app later just returns
-///   the same one.
+///   (no mood check-in). Fixed once assigned for the day.
 /// - [onDemand]: the "how are you, right now?" pick, driven by the mood
-///   check-in. Also cached per day like the others, but callers can pass
-///   `forceReroll: true` (see [ReflectionDailyService.getSlotReflection])
-///   to get a fresh pick without waiting for tomorrow — this is what
-///   solves the old "one reflection and then you're done for the day"
-///   dead end.
+///   check-in. Callers can pass `forceReroll: true` for a fresh pick.
 enum ReflectionSlot { morning, evening, onDemand }
 
 extension ReflectionSlotKey on ReflectionSlot {
@@ -26,14 +20,8 @@ extension ReflectionSlotKey on ReflectionSlot {
       };
 }
 
-/// A single day's ambient "headline" picks -- Morning and/or Evening,
-/// whichever have been assigned so far for that date. Deliberately
-/// excludes the on-demand/check-in slot: that one can be rerolled
-/// repeatedly in a single day via "Something else", so unlike the
-/// ambient slots it doesn't represent one stable daily pick worth
-/// calling a "headline". See [ReflectionDailyService.getDailyHeadlines].
 class DailyHeadline {
-  final String date; // yyyy-MM-dd
+  final String date;
   final String? morningId;
   final String? eveningId;
 
@@ -44,42 +32,72 @@ class DailyHeadline {
   });
 }
 
-/// Picks and persists reflections for up to three daily "slots" —
-/// morning, evening, and an on-demand mood-driven pick — replacing the
-/// old single "today's reflection" model.
+/// Picks and persists reflections for up to three daily "slots" --
+/// morning, evening, and an on-demand mood-driven pick.
 ///
-/// Storage shape: `{"2026-07-21": {"morning": "r014", "evening": "r002"}}`
-/// — one date entry holding a map of slot -> reflection id. This is a
-/// new storage key (not a migration of the old flat `date -> id` map),
-/// since this is early-stage personal data and a from-scratch start is
-/// simpler and safer than writing one-time migration logic for a single
-/// user's local data.
+/// MATCHING STRATEGY: a diagnostic against the real embedded corpus
+/// showed only ~10% of reflections were EVER reachable as a
+/// Morning/Evening headline under top-N nearest-neighbor matching --
+/// most reflections are universal/timeless text with no real semantic
+/// relationship to weather or time-of-day, so "best match" always
+/// picked from the same narrow ~30-reflection slice regardless of
+/// actual conditions. That slice was the loop.
 ///
-/// Picking mechanics: ranks all reflections against the current context
-/// vector, excludes anything shown recently (see [_recentlyShownIds] and
-/// the progressive-relaxation logic in [getSlotReflection]), then picks
-/// randomly from the top [topPoolSize] of what's left.
+/// So each slot now:
+///   1. Ranks the full corpus against its context vector.
+///   2. Excludes only the worst-scoring tail (`exclusionFraction`) as
+///      "clearly wrong for this moment" -- a coarse sanity filter,
+///      not a precision picker.
+///   3. Picks uniformly at random from what's left, after recency
+///      exclusion and (for headline slots) cooldown exclusion.
+///
+/// Weather/time/mood still matter -- a stormy-day reflection is still
+/// less likely to appear on a clear day -- but the large majority of
+/// "timeless" content can now actually rotate through, which top-N
+/// never allowed.
 class ReflectionDailyService {
-  static const _keyAssignedReflections =
-      'assigned_reflections_v2'; // date -> {slot -> reflectionId}
-  static const _keyHistory =
-      'reflection_shown_history'; // list of {id, date, slot}
+  static const _keyAssignedReflections = 'assigned_reflections_v2';
+  static const _keyHistory = 'reflection_shown_history';
+  static const _keySimilarBandHistory = 'explore_similar_band_history';
 
   final ReflectionEmbeddingService _embeddingService;
   final int recencyWindowDays;
-  final int topPoolSize;
+
+  /// How long a reflection is barred from headline duty after being
+  /// shown as one, OR after being offered in Explore's "similar" band.
+  /// Now mostly a safety net rather than the primary anti-repeat
+  /// mechanism -- see class doc -- since the eligible pool is large
+  /// enough that plain randomness does most of the work.
+  final int headlineCooldownDays;
+  final int exploreCooldownDays;
+
+  /// Floor below which exclusion/cooldown gets relaxed rather than
+  /// leaving a near-empty pool to pick from.
+  final int minCandidateFloor;
+
+  /// Fraction of the ranked corpus excluded as "worst match" before
+  /// picking randomly from the rest. 0.25 for headlines: the bottom
+  /// quarter (least weather/time-relevant) is excluded, the top
+  /// three-quarters are all fair game -- deliberately loose, since
+  /// most of this corpus is timeless and shouldn't be gatekept by a
+  /// weak time/weather signal.
+  final double headlineExclusionFraction;
+
+  /// Tighter than headlines: mood (weighted to dominate below) is a
+  /// more meaningful signal than weather/time turned out to be, so
+  /// it's worth trusting a bit more.
+  final double onDemandExclusionFraction;
+
   final Random _random;
 
   ReflectionDailyService({
     ReflectionEmbeddingService? embeddingService,
     this.recencyWindowDays = 14,
-    // Wider than before (was 6). A pool this small got exhausted fast
-    // whenever the same mood/weather/time context recurred (which
-    // happens a lot -- moods and weather don't vary infinitely), so
-    // repeats started showing up well before the recency window even
-    // expired. A bigger pool means more genuinely-different picks
-    // before anything has to repeat.
-    this.topPoolSize = 20,
+    this.headlineCooldownDays = 30,
+    this.exploreCooldownDays = 30,
+    this.minCandidateFloor = 15,
+    this.headlineExclusionFraction = 0.25,
+    this.onDemandExclusionFraction = 0.20,
     Random? random,
   })  : _embeddingService = embeddingService ?? ReflectionEmbeddingService(),
         _random = random ?? Random();
@@ -93,8 +111,7 @@ class ReflectionDailyService {
   }
 
   /// Maps the current hour into one of the four precomputed time
-  /// buckets from context_options.json. Purely a lookup — no model,
-  /// no embedding happens here.
+  /// buckets. Purely a lookup -- no model, no embedding happens here.
   static String timeBucketIdForHour(int hour) {
     if (hour >= 5 && hour < 11) return 'time_morning';
     if (hour >= 11 && hour < 17) return 'time_midday';
@@ -106,23 +123,6 @@ class ReflectionDailyService {
   // Core slot API
   // ---------------------------------------------------------------------
 
-  /// Returns the reflection for [slot], picking a new one only if this
-  /// slot doesn't have one assigned yet today (or if [forceReroll] is
-  /// true, which skips the cache and always picks fresh — this is what
-  /// an on-demand "give me another" button should call).
-  ///
-  /// [moodId] and [weatherId] are both optional: pass a mood id for the
-  /// on-demand slot (that's the whole point of that slot), and pass
-  /// [weatherId] whenever you have a current reading, for any slot. The
-  /// time bucket is always computed automatically and always included,
-  /// so a context vector can always be built even with no mood/weather.
-  ///
-  /// [timeId] optionally pins the time-of-day context (e.g. always
-  /// `'time_morning'` for the morning slot) instead of deriving it from
-  /// the current clock — so a slot keeps its intended flavor no matter
-  /// what time it's actually opened/picked at. Omit it to fall back to
-  /// whatever bucket the current hour maps to (what the on-demand slot
-  /// wants, since it's meant to reflect "right now").
   Future<EmbeddedReflection> getSlotReflection({
     required ReflectionSlot slot,
     String? moodId,
@@ -142,23 +142,44 @@ class ReflectionDailyService {
         final all = await _embeddingService.allReflections();
         final existing = all.where((r) => r.id == existingId);
         if (existing.isNotEmpty) return existing.first;
-        // Stored id no longer exists (reflections.json changed) — fall
-        // through and pick a fresh one below.
+        // Stored id no longer exists -- fall through and pick fresh.
       }
     }
 
     final resolvedTimeId = timeId ?? timeBucketIdForHour(DateTime.now().hour);
-    final contextVector = await _embeddingService.buildContextVector(
-      moodId: moodId,
-      weatherId: weatherId,
-      timeId: resolvedTimeId,
+    final isHeadlineSlot =
+        slot == ReflectionSlot.morning || slot == ReflectionSlot.evening;
+
+    final contextVector = isHeadlineSlot
+        ? await _embeddingService.buildContextVector(
+            weatherId: weatherId,
+            timeId: resolvedTimeId,
+          )
+        : await _embeddingService.buildContextVector(
+            moodId: moodId,
+            weatherId: weatherId,
+            timeId: resolvedTimeId,
+            // Mood dominates the on-demand pick -- it's the whole
+            // point of "how are you, right now?". Headline slots
+            // already own weather/time as their primary signal.
+            moodWeight: 2.0,
+            weatherWeight: 0.4,
+            timeWeight: 0.6,
+          );
+
+    final cooldownIds =
+        isHeadlineSlot ? await _headlineCooldownIds(prefs) : <String>{};
+    final exclusionFraction =
+        isHeadlineSlot ? headlineExclusionFraction : onDemandExclusionFraction;
+
+    final eligible = await _rankEligiblePool(
+      prefs,
+      contextVector,
+      cooldownIds: cooldownIds,
+      exclusionFraction: exclusionFraction,
     );
 
-    final ranked = await _rankWithRelaxedRecency(prefs, contextVector);
-
-    final poolSize = min(topPoolSize, ranked.length);
-    final pool = ranked.take(poolSize).toList();
-    final picked = pool[_random.nextInt(pool.length)].reflection;
+    final picked = eligible[_random.nextInt(eligible.length)].reflection;
 
     todaysSlots[slot.storageKey] = picked.id;
     assignedMap[today] = todaysSlots;
@@ -168,44 +189,120 @@ class ReflectionDailyService {
     return picked;
   }
 
-  /// Ranks [contextVector] against reflections, excluding recently-shown
-  /// ones -- but instead of an all-or-nothing cutoff (full recency
-  /// window, or none at all), progressively shrinks the recency window
-  /// until there are enough non-recent candidates to fill [topPoolSize].
-  ///
-  /// The old behavior dropped recency exclusion entirely the moment the
-  /// full window's candidates ran dry, which could hand back something
-  /// shown minutes ago. Shrinking the window in steps means the *most*
-  /// recently shown reflections stay excluded for as long as possible,
-  /// and only the least-recently-excluded ones get let back in first.
-  Future<List<ScoredReflection>> _rankWithRelaxedRecency(
+  /// Ranks [contextVector] against the corpus, excluding recently-shown
+  /// ids (progressively relaxed) and [cooldownIds], then keeps
+  /// everything except the bottom [exclusionFraction] of what's left --
+  /// a loose "not clearly wrong" filter rather than a "best match"
+  /// filter. Drops [cooldownIds] entirely as a last resort only if
+  /// even a fully-relaxed recency window isn't enough to clear
+  /// [minCandidateFloor].
+  Future<List<ScoredReflection>> _rankEligiblePool(
     SharedPreferences prefs,
-    List<double> contextVector,
-  ) async {
+    List<double> contextVector, {
+    Set<String> cooldownIds = const {},
+    required double exclusionFraction,
+  }) async {
     var window = recencyWindowDays;
 
     while (true) {
       final recentIds = await _recentlyShownIds(prefs, windowDays: window);
       final ranked = await _embeddingService.rank(
         contextVector,
-        excludeIds: recentIds,
+        excludeIds: {...recentIds, ...cooldownIds},
       );
+      final eligible = _topFraction(ranked, exclusionFraction);
 
-      if (ranked.length >= topPoolSize || window <= 0) {
-        return ranked;
+      if (eligible.length >= minCandidateFloor || window <= 0) {
+        if (eligible.length >= minCandidateFloor || cooldownIds.isEmpty) {
+          return eligible;
+        }
+        final fallbackRanked = await _embeddingService.rank(
+          contextVector,
+          excludeIds: recentIds,
+        );
+        return _topFraction(fallbackRanked, exclusionFraction);
       }
 
-      // Not enough fresh candidates yet -- shrink the window (halving,
-      // floor at 0) and try again before giving up recency exclusion
-      // altogether.
       window = window ~/ 2;
     }
   }
 
-  /// Convenience for a reroll: always picks fresh for [slot], ignoring
-  /// (and then overwriting) whatever was cached for it today. Intended
-  /// for the on-demand slot's "something else" action, but works for
-  /// any slot if you want that elsewhere.
+  /// Keeps the top (1 - [exclusionFraction]) of [ranked], but never
+  /// fewer than [minCandidateFloor] (or the whole list, if smaller).
+  List<ScoredReflection> _topFraction(
+    List<ScoredReflection> ranked,
+    double exclusionFraction,
+  ) {
+    if (ranked.isEmpty) return ranked;
+    final byFraction = (ranked.length * (1 - exclusionFraction)).ceil();
+    final count = max(byFraction, min(minCandidateFloor, ranked.length));
+    return ranked.take(count).toList();
+  }
+
+  Future<Set<String>> _headlineCooldownIds(SharedPreferences prefs) async {
+    final ids = <String>{};
+
+    final history = await _getHistory(prefs);
+    final headlineCutoff =
+        DateTime.now().subtract(Duration(days: headlineCooldownDays));
+    for (final entry in history) {
+      final slot = entry['slot'];
+      if (slot != ReflectionSlot.morning.storageKey &&
+          slot != ReflectionSlot.evening.storageKey) {
+        continue;
+      }
+      final date = DateTime.tryParse(entry['date'] ?? '');
+      if (date != null && date.isAfter(headlineCutoff)) {
+        ids.add(entry['id']!);
+      }
+    }
+
+    final similarShown = await _getSimilarBandHistory(prefs);
+    final exploreCutoff =
+        DateTime.now().subtract(Duration(days: exploreCooldownDays));
+    for (final entry in similarShown) {
+      final date = DateTime.tryParse(entry['date'] ?? '');
+      if (date != null && date.isAfter(exploreCutoff)) {
+        ids.add(entry['id']!);
+      }
+    }
+
+    return ids;
+  }
+
+  Future<List<Map<String, String>>> _getSimilarBandHistory(
+      SharedPreferences prefs) async {
+    final raw = prefs.getString(_keySimilarBandHistory);
+    if (raw == null) return [];
+    final decoded = jsonDecode(raw) as List<dynamic>;
+    return decoded
+        .map((e) => (e as Map<String, dynamic>)
+            .map((k, v) => MapEntry(k, v.toString())))
+        .toList();
+  }
+
+  /// Records that [ids] were just offered as Explore's "similar to
+  /// this headline" band. Called regardless of whether the user swipes
+  /// to any of them -- being shown there and being picked both count
+  /// as "seen" for headline cooldown purposes. Only called from the
+  /// ambient (Morning/Evening) entry point into Explore.
+  Future<void> recordSimilarBandShown(List<String> ids) async {
+    if (ids.isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    final history = await _getSimilarBandHistory(prefs);
+    final today = _todayString();
+    for (final id in ids) {
+      history.add({'id': id, 'date': today});
+    }
+    final cutoff = DateTime.now().subtract(
+        Duration(days: max(headlineCooldownDays, exploreCooldownDays) + 7));
+    final trimmed = history.where((entry) {
+      final date = DateTime.tryParse(entry['date'] ?? '');
+      return date == null || date.isAfter(cutoff);
+    }).toList();
+    await prefs.setString(_keySimilarBandHistory, jsonEncode(trimmed));
+  }
+
   Future<EmbeddedReflection> rerollSlot({
     required ReflectionSlot slot,
     String? moodId,
@@ -219,9 +316,6 @@ class ReflectionDailyService {
     );
   }
 
-  /// True if [slot] already has a reflection assigned today. Lets the
-  /// UI skip asking for mood/weather again and just fetch the cached
-  /// pick via [getSlotIfAssigned].
   Future<bool> hasSlotAssignment(ReflectionSlot slot) async {
     final prefs = await SharedPreferences.getInstance();
     final assignedMap = await _getAssignedMap(prefs);
@@ -229,8 +323,6 @@ class ReflectionDailyService {
     return todaysSlots != null && todaysSlots.containsKey(slot.storageKey);
   }
 
-  /// Returns [slot]'s reflection if already assigned today, without
-  /// triggering a pick. Null if nothing's been picked yet for that slot.
   Future<EmbeddedReflection?> getSlotIfAssigned(ReflectionSlot slot) async {
     final prefs = await SharedPreferences.getInstance();
     final assignedMap = await _getAssignedMap(prefs);
@@ -242,12 +334,6 @@ class ReflectionDailyService {
     return existing.isNotEmpty ? existing.first : null;
   }
 
-  /// Every date's ambient (Morning/Evening) picks, most recent first --
-  /// each date deduplicated to at most one id per slot, since that's
-  /// exactly what the assignment map already stores (rerolls of the
-  /// on-demand slot overwrite in place rather than piling up, but this
-  /// method skips on-demand entirely regardless -- see [DailyHeadline]).
-  /// Dates where neither ambient slot was ever assigned are omitted.
   Future<List<DailyHeadline>> getDailyHeadlines() async {
     final prefs = await SharedPreferences.getInstance();
     final assignedMap = await _getAssignedMap(prefs);
@@ -271,7 +357,6 @@ class ReflectionDailyService {
   // Storage helpers
   // ---------------------------------------------------------------------
 
-  /// date -> {slot -> reflectionId}
   Future<Map<String, Map<String, String>>> _getAssignedMap(
       SharedPreferences prefs) async {
     final raw = prefs.getString(_keyAssignedReflections);
@@ -291,11 +376,6 @@ class ReflectionDailyService {
     await prefs.setString(_keyAssignedReflections, jsonEncode(map));
   }
 
-  /// History entries as {"id": ..., "date": "yyyy-MM-dd", "slot": ...},
-  /// newest last. [slot] is informational (e.g. for a future archive
-  /// screen) — recency exclusion below ignores it deliberately, so a
-  /// reflection shown as this morning's pick won't turn right around
-  /// as tonight's pick either.
   Future<List<Map<String, String>>> _getHistory(
       SharedPreferences prefs) async {
     final raw = prefs.getString(_keyHistory);
@@ -318,11 +398,6 @@ class ReflectionDailyService {
     await prefs.setString(_keyHistory, jsonEncode(history));
   }
 
-  /// Ids shown within the last [windowDays] days, across all slots,
-  /// used to keep any pick from repeating something shown recently
-  /// regardless of which slot showed it. [windowDays] defaults to
-  /// [recencyWindowDays] but callers (see [_rankWithRelaxedRecency]) can
-  /// pass a smaller value to progressively relax the exclusion.
   Future<Set<String>> _recentlyShownIds(
     SharedPreferences prefs, {
     int? windowDays,
@@ -341,11 +416,6 @@ class ReflectionDailyService {
     return recent;
   }
 
-  /// Full shown-reflection history, most recent first. Each entry
-  /// carries which slot showed it. Note this includes every reroll of
-  /// the on-demand slot as a separate entry (that's what recency
-  /// exclusion needs) -- for a deduplicated "one pick per day" view,
-  /// use [getDailyHeadlines] instead.
   Future<List<Map<String, String>>> getHistory() async {
     final prefs = await SharedPreferences.getInstance();
     final history = await _getHistory(prefs);

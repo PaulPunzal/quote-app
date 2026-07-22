@@ -398,28 +398,40 @@ class _HomeScreenState extends State<HomeScreen>
         weatherId: contextWeatherId,
         timeId: contextTimeId,
       );
-      // Don't show the reflection that's already on-screen for this
-      // slot as one of the "other" ones.
-      final currentId =
-          contextTimeId == 'time_morning' ? _morning?.id : _evening?.id;
+
+      // Exclude BOTH headlines, not just the tab Explore was opened
+      // from -- otherwise Evening's pick can still surface as an
+      // "other reflection" while exploring from Morning (and vice
+      // versa), which still reads as a repeat.
+      final excludeIds = <String>{
+        if (_morning?.id != null) _morning!.id,
+        if (_evening?.id != null) _evening!.id,
+      };
       final ranked = await _embeddingService.rank(
         contextVector,
-        excludeIds: {if (currentId != null) currentId},
+        excludeIds: excludeIds,
       );
 
-      // A small, fixed-size "genuinely similar" band up front (see
-      // ReflectionEmbeddingService.similarBand) -- capped at exactly 5
-      // regardless of corpus size, so it stays a handful of honestly
-      // close matches rather than a big chunk of everything.
+      // 3 (was 5): a smaller taste of "close to this mood" up front,
+      // and less for headline cooldown to sideline every time Explore
+      // is opened -- see recordSimilarBandShown below.
       final similar = _embeddingService
-          .similarBand(ranked, minPoolSize: 5, maxPoolSize: 5)
+          .similarBand(ranked, minPoolSize: 3, maxPoolSize: 3)
           .map((s) => s.reflection)
           .toList()
         ..shuffle();
       final similarIds = similar.map((r) => r.id).toSet();
 
-      // Everything else in the corpus (still excluding the on-screen
-      // reflection), shuffled, so swiping past the similar handful
+      // Being shown here counts the same as being picked as a
+      // headline, for cooldown purposes -- otherwise a reflection
+      // could bounce between "shown in Explore" and "picked as
+      // tomorrow's headline" indefinitely without ever actually
+      // resting.
+      await _dailyService
+          .recordSimilarBandShown(similar.map((r) => r.id).toList());
+
+      // Everything else in the corpus (still excluding both
+      // headlines), shuffled, so swiping past the similar handful
       // leads into fresh, never-repeating material instead of looping.
       final remainder = ranked
           .where((s) => !similarIds.contains(s.reflection.id))
