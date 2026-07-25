@@ -9,46 +9,39 @@ import '../../services/weather_service.dart';
 import '../../widgets/mood_check_in_sheet.dart';
 import '../browse_screen.dart';
 import '../favorites_screen.dart';
-import '../history_screen.dart';
-import '../weather_location_screen.dart';
-import 'widgets/ambient_tab.dart';
 import 'widgets/explore_view.dart';
-import 'widgets/on_demand_tab.dart';
+import 'widgets/locked_placeholder.dart';
+import 'widgets/reflection_slot_view.dart';
 import 'widgets/weather_strip.dart';
 
-/// The main screen — three tabs:
-///   - Morning / Evening: ambient picks, auto-assigned from weather + a
-///     fixed time-of-day context (not the current clock — see
-///     ReflectionDailyService.getSlotReflection's `timeId` doc). Fixed
-///     for the day once picked, but can be manually rerolled (subject
-///     to a short per-tab cooldown) via the small refresh icon over the
-///     reflection -- rerolling reuses that tab's already-fetched
-///     weather reading rather than fetching fresh, since "not this one"
-///     is a different intent than "conditions changed."
+/// The main screen -- one body, no tabs. Which slot is "current" is
+/// computed purely from the clock (see [_resolveCurrentSlot]):
 ///
-///     Morning is picked the moment the app is opened (whenever that
-///     is). Evening is picked lazily — the first time the Evening tab
-///     is actually viewed after 5pm — rather than at the same moment
-///     as morning. That way each slot gets its own fresh weather
-///     reading taken when it's actually needed, instead of both being
-///     decided off a single weather fetch from whenever the app
-///     happened to be opened that day (which could be hours before
-///     evening even arrives).
-///   - Check in: the old mood-check-in flow, now explicitly triggered
-///     by a button rather than blocking the screen on load. Supports
-///     "Something else" to re-roll (re-asking mood) instead of being
-///     stuck with one pick for the whole day.
+///   - Before 5am: shows yesterday's already-finished Evening
+///     reflection, read-only (decision 6) -- no new check-in, no
+///     reroll. If there's no prior Evening pick at all (first-ever
+///     launch before 5am), falls back to the old locked placeholder.
+///   - 5am-5pm: Morning is current.
+///   - After 5pm: Evening is current, replacing whatever was on
+///     screen (Morning's own pick for the day is untouched in
+///     storage, just no longer displayed).
 ///
-/// Explore mode (shuffle through everything) is unchanged conceptually,
-/// just reachable from any tab instead of being tied to one reflection.
-/// Because it's entered by reading whichever reflection is currently
-/// assigned to that tab's state field, a manual reroll of Morning or
-/// Evening is automatically reflected the next time Explore is entered
-/// from that tab -- no extra plumbing needed.
+/// Reopening the app within an already-picked slot's window shows
+/// that pick with no re-prompt (decision 7). Only a manual reroll
+/// re-touches the mood check-in; Explore reuses whatever context
+/// (mood-ranked or random) produced the currently-shown reflection
+/// without asking again (decision 4).
 ///
-/// This class owns all state and business logic; the actual tab/explore
-/// bodies live in sibling files under widgets/ so this file doesn't have
-/// to grow every time the UI gets a new piece.
+/// This replaces the old 3-tab (Morning / Check-in / Evening) design.
+/// Both slots are now picked identically -- see
+/// `ReflectionDailyService` -- so there's no structural reason left
+/// for separate tab widgets; `ReflectionSlotView` covers every state a
+/// single slot can be in.
+///
+/// Weather Location and History used to be separate icon buttons on
+/// this screen's app bar. They now live inside the "All Reflections"
+/// (Browse) screen instead, reached via the same book icon -- this
+/// app bar only exposes Favorites and Browse now.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
@@ -57,7 +50,7 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
   final ReflectionDailyService _dailyService = ReflectionDailyService();
   final ReflectionEmbeddingService _embeddingService =
       ReflectionEmbeddingService();
@@ -65,60 +58,54 @@ class _HomeScreenState extends State<HomeScreen>
   final FavoritesService _favoritesService = FavoritesService();
   final WeatherService _weatherService = WeatherService();
 
-  late final TabController _tabController;
+  /// Null only in the pre-5am carryover view -- there is no "current"
+  /// Morning/Evening slot at that point, just a read-only look back at
+  /// last night.
+  ReflectionSlot? _currentSlot;
 
-  EmbeddedReflection? _morning;
-  EmbeddedReflection? _evening;
-  EmbeddedReflection? _onDemand;
+  EmbeddedReflection? _currentReflection;
+  bool _loading = true;
 
-  bool _loadingAmbient = true;
+  /// True only for the pre-5am carryover view (decision 6). Disables
+  /// reroll and the check-in prompt -- browsing (Explore) still works.
+  bool _isReadOnlyCarryover = false;
 
-  /// Separate from [_loadingAmbient] because evening now loads on its
-  /// own schedule (see class doc) — it can still be "not yet picked"
-  /// well after morning has finished loading.
-  bool _loadingEvening = true;
+  /// True when [_currentSlot] hasn't been picked yet today and isn't
+  /// read-only -- the slot view shows a "Check in with yourself" CTA
+  /// instead of a reflection.
+  bool _needsCheckIn = false;
 
-  bool _onDemandLoading = false;
+  /// The moodId that produced [_currentReflection], IF this session
+  /// is the one that picked it. Null means either "picked randomly"
+  /// or "picked in an earlier session, context unknown" -- Explore
+  /// treats both the same way: no similarity signal to build a
+  /// "similar" band from, so it falls back to a full random shuffle
+  /// (decision 4's stated fallback, now also covering the
+  /// resumed-session case).
+  String? _currentMoodId;
 
-  /// The weatherId actually used (or attempted) the moment each ambient
-  /// slot's weather was fetched. Kept purely so "See other reflections"
-  /// (and manual rerolls) can rank against the same weather+time
-  /// context the currently-shown reflection was picked from, instead of
-  /// re-fetching weather or ranking with no context at all.
-  String? _morningWeatherId;
-  String? _eveningWeatherId;
+  /// The weatherId used for whichever pick informed
+  /// [_currentReflection] this session -- reused (not re-fetched) if
+  /// Explore needs to rebuild the same context vector for a similar
+  /// band.
+  String? _currentWeatherIdUsed;
 
-  /// Per-tab manual-reroll cooldown flags. False for [_rerollCooldown]
-  /// after a reroll, to prevent rapid-fire tapping; independent per
-  /// tab since morning/evening are separate contexts. This is purely a
-  /// tap-rate limiter -- the actual "can't repeat the same reflection"
-  /// guarantee lives in ReflectionDailyService's hard-exclude layer and
-  /// applies regardless of how long you wait between rerolls.
-  bool _canRerollMorning = true;
-  bool _canRerollEvening = true;
+  bool _canReroll = true;
   static const Duration _rerollCooldown = Duration(seconds: 3);
 
   Set<String> _favoriteIds = {};
 
-  /// Most recent weather reading, kept around purely for the
-  /// [WeatherStrip] label — the *matching* itself reads straight from
-  /// SharedPreferences via WeatherService each time a slot is picked,
-  /// so this field never gates anything.
+  /// Kept purely for the WeatherStrip label -- matching itself always
+  /// reads fresh from WeatherService when a pick actually happens.
   WeatherSnapshot? _weatherSnapshot;
 
   late final AnimationController _fadeController;
   late final Animation<double> _fadeAnimation;
 
-  // --- Explore mode state ---
+  // --- Explore mode state (structurally unchanged from before) ---
   bool _exploring = false;
   final PageController _pageController = PageController();
   List<EmbeddedReflection> _explorePool = [];
-
-  /// Ids currently offered in Explore's "similar to this headline"
-  /// band. Being included here doesn't cost a reflection its headline
-  /// rotation turn on its own -- only actually reading it (read-
-  /// cooldown completing while it's the current page) does. See the
-  /// _readController status listener below.
   Set<String> _similarBandIds = {};
 
   static const Duration _readCooldown = Duration(seconds: 3);
@@ -141,21 +128,7 @@ class _HomeScreenState extends State<HomeScreen>
   @override
   void initState() {
     super.initState();
-
-    // Default tab follows the clock so the app still feels timely on
-    // open. Before 5am neither ambient tab is unlocked yet (see
-    // _isMorningUnlocked/_isEveningUnlocked below), so land on Check In
-    // instead of a locked tab.
-    _tabController = TabController(
-      length: 3,
-      vsync: this,
-      initialIndex: _initialTabIndex(),
-    );
-    // Evening's reflection is picked lazily (see class doc) — this
-    // catches the case where the app is opened after 5pm and the user
-    // switches back and forth into the Evening tab later in the same
-    // session, or lands there via a tab change rather than at launch.
-    _tabController.addListener(_onTabChanged);
+    WidgetsBinding.instance.addObserver(this);
 
     _fadeController = AnimationController(
       vsync: this,
@@ -177,10 +150,6 @@ class _HomeScreenState extends State<HomeScreen>
           _readIndices.add(_currentExploreIndex);
         });
 
-        // Only counts as "used" once actually read (cooldown
-        // completed while it's the current page), not merely offered
-        // in the pool -- so scrolling straight past something in
-        // Explore doesn't cost it its headline rotation turn.
         if (_currentExploreIndex < _explorePool.length) {
           final currentId = _explorePool[_currentExploreIndex].id;
           if (_similarBandIds.contains(currentId)) {
@@ -189,54 +158,122 @@ class _HomeScreenState extends State<HomeScreen>
         }
       });
 
-    _loadAmbientReflections();
-    _loadExistingOnDemand();
+    _load();
     _loadFavorites();
   }
 
-  Future<void> _loadFavorites() async {
-    final ids = await _favoritesService.getAll();
-    if (mounted) setState(() => _favoriteIds = ids);
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _fadeController.dispose();
+    _readController.dispose();
+    _pageController.dispose();
+    super.dispose();
   }
 
-  /// Flips [id]'s favorited state and updates local state so every tab
-  /// showing that reflection re-renders its heart immediately.
-  Future<void> _toggleFavorite(String id) async {
-    final updated = await _favoritesService.toggle(id);
+  /// Recomputes the current slot on resume, so leaving the app
+  /// backgrounded across a slot boundary (e.g. open at 4:58pm, reopen
+  /// at 5:05pm) picks it up without needing a fresh cold start.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _load();
+      _refreshWeatherSnapshot();
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Slot resolution + loading
+  // ---------------------------------------------------------------------
+
+  /// Pure function of the clock -- see class doc for the exact
+  /// boundaries. Null means "pre-5am carryover," not a real slot.
+  ReflectionSlot? _resolveCurrentSlot() {
+    final hour = DateTime.now().hour;
+    if (hour < 5) return null;
+    return hour < 17 ? ReflectionSlot.morning : ReflectionSlot.evening;
+  }
+
+  static String _dateToString(DateTime date) {
+    final mm = date.month.toString().padLeft(2, '0');
+    final dd = date.day.toString().padLeft(2, '0');
+    return '${date.year}-$mm-$dd';
+  }
+
+  Future<void> _load() async {
+    final slot = _resolveCurrentSlot();
+    if (slot == null) {
+      await _loadYesterdayEveningCarryover();
+    } else {
+      await _loadCurrentSlot(slot);
+    }
+    _scheduleTomorrowNotification();
+  }
+
+  Future<void> _loadYesterdayEveningCarryover() async {
+    setState(() {
+      _loading = true;
+      _isReadOnlyCarryover = true;
+      _currentSlot = null;
+      _needsCheckIn = false;
+    });
+
+    final yesterday = DateTime.now().subtract(const Duration(days: 1));
+    final reflection = await _dailyService.getSlotForDate(
+      ReflectionSlot.evening,
+      _dateToString(yesterday),
+    );
+
     if (!mounted) return;
-    setState(() => _favoriteIds = updated);
+    setState(() {
+      _currentReflection = reflection;
+      // Context from a prior day/session is never assumed known -- see
+      // _currentMoodId doc.
+      _currentMoodId = null;
+      _currentWeatherIdUsed = null;
+      _loading = false;
+    });
+
+    if (reflection != null) _revealWithFade();
   }
 
-  /// Opens the Favorites list screen. Un-favoriting a reflection while
-  /// there (or anywhere else) changes the same underlying storage, so
-  /// we just reload [_favoriteIds] on return to stay in sync — no need
-  /// to pass data back and forth manually.
-  Future<void> _openFavorites() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => FavoritesScreen()),
-    );
-    await _loadFavorites();
+  Future<void> _loadCurrentSlot(ReflectionSlot slot) async {
+    setState(() {
+      _loading = true;
+      _isReadOnlyCarryover = false;
+      _currentSlot = slot;
+    });
+
+    final existing = await _dailyService.getSlotIfAssigned(slot);
+    if (existing != null) {
+      if (!mounted) return;
+      setState(() {
+        _currentReflection = existing;
+        _needsCheckIn = false;
+        _loading = false;
+        // Unknown whether this session or an earlier one picked it --
+        // treat as unknown/random for Explore's purposes (see field
+        // doc on _currentMoodId).
+        _currentMoodId = null;
+        _currentWeatherIdUsed = null;
+      });
+      _revealWithFade();
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _currentReflection = null;
+      _needsCheckIn = true;
+      _loading = false;
+    });
   }
 
-  /// Opens the History screen (everything ever shown, by date/slot).
-  /// Same reasoning as [_openFavorites] -- favoriting is possible from
-  /// there too, so refresh local state on return.
-  Future<void> _openHistory() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const HistoryScreen()),
-    );
-    await _loadFavorites();
-  }
-
-  /// Opens the weather location settings. A location change doesn't
-  /// reroll anything already picked today (that would be jarring) — it
-  /// just refreshes the label shown in the UI and takes effect on the
-  /// next slot pick (tomorrow's ambient picks, or the next check-in).
-  Future<void> _openWeatherSettings() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const WeatherLocationScreen()),
-    );
-    await _refreshWeatherSnapshot();
+  Future<void> _revealWithFade() async {
+    _fadeController.stop();
+    _fadeController.value = 0;
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (mounted) _fadeController.forward();
   }
 
   Future<void> _refreshWeatherSnapshot() async {
@@ -244,271 +281,174 @@ class _HomeScreenState extends State<HomeScreen>
     if (mounted) setState(() => _weatherSnapshot = snapshot);
   }
 
-  int _initialTabIndex() {
-    final hour = DateTime.now().hour;
-    if (hour < 5) return 1; // both ambient tabs locked — land on Check In
-    return hour < 17 ? 0 : 2;
-  }
-
-  /// Morning unlocks at 5am and stays visible the rest of the day —
-  /// once morning has actually happened there's nothing left to spoil.
-  bool get _isMorningUnlocked => DateTime.now().hour >= 5;
-
-  /// Evening unlocks at 5pm, same reasoning. Both flip back to locked
-  /// at midnight because a fresh date means a fresh (not-yet-picked-
-  /// for-real) slot, even though the reflection itself is pre-picked
-  /// silently the moment the tab is opened.
-  bool get _isEveningUnlocked => DateTime.now().hour >= 17;
-
-  /// Called on every tab-controller change (fires while the swipe/tap
-  /// animation is in flight, then again once it settles). We only act
-  /// once it settles on the Evening tab, since that's the first
-  /// reliable point to say "the user is actually looking at Evening
-  /// now" — the right moment to fetch a fresh weather reading and pick
-  /// evening's reflection if it hasn't been picked yet today.
-  void _onTabChanged() {
-    if (_tabController.indexIsChanging) return;
-    if (_tabController.index == 2 && _isEveningUnlocked && _evening == null) {
-      _pickEveningReflection();
-    }
-  }
-
-  /// Fetches current weather (online) or falls back to the last cached
-  /// reading (offline) via WeatherService, mapping it to one of the
-  /// 'weather_*' context ids. Also updates [_weatherSnapshot] so the UI
-  /// can show what conditions actually informed the pick. Returns null
-  /// if no location has been configured yet, or if there's neither a
-  /// fresh reading nor a cached one to fall back to — matching runs on
-  /// time (and mood, for the check-in tab) alone in that case, same as
-  /// before this feature existed.
+  /// Fetches current weather (or falls back to the last cached
+  /// reading) and updates [_weatherSnapshot] for the WeatherStrip
+  /// label. Returns null if no location is configured, or neither a
+  /// fresh nor cached reading is available.
   Future<String?> _currentWeatherId() async {
     final snapshot = await _weatherService.currentSnapshot();
     if (mounted) setState(() => _weatherSnapshot = snapshot);
     return snapshot?.conditionId;
   }
 
-  /// Picks (or loads today's already-picked) morning reflection using a
-  /// weather reading fetched right now. Evening is handled separately
-  /// by [_loadOrDeferEvening] so it doesn't share morning's (possibly
-  /// hours-stale-by-evening) weather snapshot.
-  Future<void> _loadAmbientReflections() async {
-    final weatherId = await _currentWeatherId();
-    _morningWeatherId = weatherId;
-
-    final morning = await _dailyService.getSlotReflection(
-      slot: ReflectionSlot.morning,
-      weatherId: weatherId,
-      timeId: 'time_morning',
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _morning = morning;
-      _loadingAmbient = false;
-    });
-
-    await _loadOrDeferEvening();
-
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (mounted) _fadeController.forward();
-
-    _scheduleTomorrowNotification();
-  }
-
-  /// Loads today's evening reflection if it's already been picked
-  /// earlier (e.g. reopening the app later the same evening), picks it
-  /// fresh right now if the app happened to be opened after 5pm and
-  /// nothing's assigned yet for today, or otherwise leaves it unpicked
-  /// so [_onTabChanged] can pick it — with a weather reading fetched at
-  /// that moment — the first time the Evening tab is actually viewed
-  /// after unlock.
-  Future<void> _loadOrDeferEvening() async {
-    final existingEvening =
-        await _dailyService.getSlotIfAssigned(ReflectionSlot.evening);
-    if (!mounted) return;
-
-    if (existingEvening != null) {
-      setState(() {
-        _evening = existingEvening;
-        _loadingEvening = false;
-      });
-    } else if (_isEveningUnlocked) {
-      // App was opened after 5pm and evening hasn't been picked yet
-      // today -- pick it now, with its own fresh weather reading.
-      await _pickEveningReflection();
-    } else {
-      // Not evening yet -- nothing to load; AmbientTab will show the
-      // locked placeholder until 5pm.
-      setState(() => _loadingEvening = false);
-    }
-  }
-
-  /// Fetches a fresh weather reading and picks (or loads, if some other
-  /// caller beat us to it) today's evening reflection. Safe to call
-  /// more than once -- the early return means only the first caller
-  /// (whichever of [_loadOrDeferEvening] or [_onTabChanged] gets there
-  /// first) actually does the work.
-  Future<void> _pickEveningReflection() async {
-    if (_evening != null) return;
-
-    setState(() => _loadingEvening = true);
-    final weatherId = await _currentWeatherId();
-    _eveningWeatherId = weatherId;
-    final evening = await _dailyService.getSlotReflection(
-      slot: ReflectionSlot.evening,
-      weatherId: weatherId,
-      timeId: 'time_evening',
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _evening = evening;
-      _loadingEvening = false;
-    });
-  }
-
-  /// Manually rerolls today's Morning reflection. Reuses
-  /// [_morningWeatherId] (the weather reading already fetched for
-  /// morning) rather than fetching fresh -- rerolling means "not this
-  /// one," not "conditions changed since I opened the app." Guarded by
-  /// [_canRerollMorning] so rapid taps are ignored; the underlying
-  /// service-layer hard-exclude guarantees the just-shown reflection
-  /// can't come back regardless of cooldown timing.
-  Future<void> _rerollMorning() async {
-    if (!_canRerollMorning) return;
-    setState(() {
-      _loadingAmbient = true;
-      _canRerollMorning = false;
-    });
-
-    final rerolled = await _dailyService.rerollSlot(
-      slot: ReflectionSlot.morning,
-      weatherId: _morningWeatherId,
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _morning = rerolled;
-      _loadingAmbient = false;
-    });
-
-    Future.delayed(_rerollCooldown, () {
-      if (mounted) setState(() => _canRerollMorning = true);
-    });
-  }
-
-  /// Same idea as [_rerollMorning], for Evening.
-  Future<void> _rerollEvening() async {
-    if (!_canRerollEvening) return;
-    setState(() {
-      _loadingEvening = true;
-      _canRerollEvening = false;
-    });
-
-    final rerolled = await _dailyService.rerollSlot(
-      slot: ReflectionSlot.evening,
-      weatherId: _eveningWeatherId,
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _evening = rerolled;
-      _loadingEvening = false;
-    });
-
-    Future.delayed(_rerollCooldown, () {
-      if (mounted) setState(() => _canRerollEvening = true);
-    });
-  }
-
-  /// If the on-demand slot was already picked earlier today (e.g.
-  /// reopening the app), show it without prompting for mood again.
-  Future<void> _loadExistingOnDemand() async {
-    final existing =
-        await _dailyService.getSlotIfAssigned(ReflectionSlot.onDemand);
-    if (existing != null && mounted) {
-      setState(() => _onDemand = existing);
-    }
-  }
-
   Future<void> _scheduleTomorrowNotification() async {
     await _notifications.init();
-    await _notifications.scheduleTomorrowGeneric(
-      hour: 8,
-      minute: 0,
-    );
+    await _notifications.scheduleTomorrowGeneric(hour: 8, minute: 0);
   }
 
-  /// Shows the mood check-in sheet and (re-)picks the on-demand
-  /// reflection. Always force-rerolls: on first check-in today the
-  /// cache is empty anyway, and on a repeat check-in ("Something
-  /// else") the person's mood may have changed, so re-asking and
-  /// always picking fresh is simpler and more honest than reusing a
-  /// stale answer.
-  Future<void> _checkIn() async {
-    final moodId = await MoodCheckInSheet.show(context);
-    if (moodId == null) return; // sheet dismissed without a choice
+  // ---------------------------------------------------------------------
+  // Check-in + picking
+  // ---------------------------------------------------------------------
 
-    setState(() => _onDemandLoading = true);
+  /// Shows the mood check-in sheet and, based on the result, either
+  /// picks/rerolls [slot] or leaves it untouched. This is the ONLY
+  /// place mood gets (re-)asked -- Explore never triggers this (see
+  /// class doc, decision 4).
+  Future<void> _promptAndPick(ReflectionSlot slot,
+      {bool forceReroll = false}) async {
+    final result = await MoodCheckInSheet.show(context);
+    switch (result) {
+      case MoodPicked(:final moodId):
+        await _pickForSlot(slot, moodId: moodId, forceReroll: forceReroll);
+      case MoodSkipped():
+        await _pickForSlot(slot, moodId: null, forceReroll: forceReroll);
+      case MoodCancelled():
+        // Leave the slot exactly as it was -- still needs check-in if
+        // it did before, still showing the same reflection if it did.
+        return;
+    }
+  }
+
+  Future<void> _pickForSlot(
+    ReflectionSlot slot, {
+    required String? moodId,
+    bool forceReroll = false,
+  }) async {
+    setState(() => _loading = true);
     final weatherId = await _currentWeatherId();
-    final reflection = await _dailyService.rerollSlot(
-      slot: ReflectionSlot.onDemand,
-      moodId: moodId,
-      weatherId: weatherId,
-    );
+
+    final reflection = forceReroll
+        ? await _dailyService.rerollSlot(
+            slot: slot,
+            moodId: moodId,
+            weatherId: weatherId,
+          )
+        : await _dailyService.getSlotReflection(
+            slot: slot,
+            moodId: moodId,
+            weatherId: weatherId,
+          );
 
     if (!mounted) return;
     setState(() {
-      _onDemand = reflection;
-      _onDemandLoading = false;
+      _currentReflection = reflection;
+      _currentMoodId = moodId;
+      _currentWeatherIdUsed = weatherId;
+      _needsCheckIn = false;
+      _loading = false;
+    });
+    _revealWithFade();
+  }
+
+  /// Manual reroll of the current slot. Always re-prompts mood
+  /// (decision 7) -- rerolling is a deliberate "not this one," and the
+  /// person's mood may have genuinely changed since the original pick.
+  Future<void> _reroll() async {
+    if (!_canReroll || _isReadOnlyCarryover || _currentSlot == null) return;
+    setState(() => _canReroll = false);
+
+    await _promptAndPick(_currentSlot!, forceReroll: true);
+
+    Future.delayed(_rerollCooldown, () {
+      if (mounted) setState(() => _canReroll = true);
     });
   }
 
-  /// Enters Explore mode. When [contextTimeId] is given (i.e. entering
-  /// from the Morning or Evening tab), the pool starts with a small
-  /// handful of reflections genuinely close to the same weather+time
-  /// context that picked the reflection currently shown on that tab --
-  /// so the first few swipes feel like a continuation of that same
-  /// ambient "mood" -- and then the rest of the corpus follows,
-  /// shuffled, so there's always something new to swipe to without
-  /// ever repeating (no looping back to the start).
+  Future<void> _checkIn() async {
+    if (_currentSlot == null) return;
+    await _promptAndPick(_currentSlot!);
+  }
+
+  // ---------------------------------------------------------------------
+  // Favorites / navigation
+  // ---------------------------------------------------------------------
+
+  Future<void> _loadFavorites() async {
+    final ids = await _favoritesService.getAll();
+    if (mounted) setState(() => _favoriteIds = ids);
+  }
+
+  Future<void> _toggleFavorite(String id) async {
+    final updated = await _favoritesService.toggle(id);
+    if (!mounted) return;
+    setState(() => _favoriteIds = updated);
+  }
+
+  Future<void> _openFavorites() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => FavoritesScreen()),
+    );
+    await _loadFavorites();
+  }
+
+  /// Opens the Browse ("All Reflections") screen, which now also hosts
+  /// navigation to Weather Location and History -- both used to be
+  /// separate icon buttons on this app bar. Refresh weather snapshot
+  /// and favorites on return, since either could have changed while
+  /// there (a location change affects the next weather fetch; History
+  /// and Favorites both allow un/favoriting).
+  Future<void> _openBrowse() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const BrowseScreen()),
+    );
+    await _refreshWeatherSnapshot();
+    await _loadFavorites();
+  }
+
+  // ---------------------------------------------------------------------
+  // Explore
+  // ---------------------------------------------------------------------
+
+  /// Enters Explore. Branches on whether the currently-shown
+  /// reflection came from a mood-ranked pick this session
+  /// ([_currentMoodId] non-null) or not (decision 4):
+  ///   - Mood-ranked: rebuild the same context vector, offer a small
+  ///     "similar to this" band up front, then the shuffled remainder.
+  ///   - Random / unknown context: no similarity signal to build a
+  ///     band from -- fully random shuffle over everything else.
   ///
-  /// Because [_morning]/[_evening] are read here at call time, this
-  /// always reflects whichever reflection is currently assigned to
-  /// that tab -- including one that was just manually rerolled.
-  ///
-  /// [contextTimeId] is omitted only if Explore is ever entered without
-  /// a specific ambient tab in mind, in which case it falls back to a
-  /// fully random shuffle over everything (the old behavior).
-  Future<void> _enterExplore({
-    String? contextTimeId,
-    String? contextWeatherId,
-  }) async {
+  /// Either way, today's Morning AND Evening picks are excluded (not
+  /// just whichever is currently displayed) along with the whole
+  /// current headline-rotation-used set, same as before this refactor.
+  Future<void> _enterExplore() async {
+    final todayMorning =
+        await _dailyService.getSlotIfAssigned(ReflectionSlot.morning);
+    final todayEvening =
+        await _dailyService.getSlotIfAssigned(ReflectionSlot.evening);
+    final rotationUsed = await _dailyService.getHeadlineRotationUsedIds();
+
+    final excludeIds = <String>{
+      if (todayMorning != null) todayMorning.id,
+      if (todayEvening != null) todayEvening.id,
+      ...rotationUsed,
+    };
+
     List<EmbeddedReflection> pool;
     Set<String> similarBandIds = {};
 
-    if (contextTimeId != null) {
+    if (_currentReflection != null && _currentMoodId != null) {
       final contextVector = await _embeddingService.buildContextVector(
-        weatherId: contextWeatherId,
-        timeId: contextTimeId,
+        moodId: _currentMoodId,
+        weatherId: _currentWeatherIdUsed,
+        timeId:
+            ReflectionDailyService.timeBucketIdForHour(DateTime.now().hour),
+        moodWeight: 2.0,
+        weatherWeight: 0.4,
+        timeWeight: 0.6,
       );
+      final ranked =
+          await _embeddingService.rank(contextVector, excludeIds: excludeIds);
 
-      // Exclude BOTH today's literal headlines AND the full headline
-      // rotation "used" set -- so a reflection that's already had its
-      // headline turn this cycle can't even be offered in the similar
-      // band, not just excluded from being re-picked outright.
-      final rotationUsed = await _dailyService.getHeadlineRotationUsedIds();
-      final excludeIds = <String>{
-        if (_morning?.id != null) _morning!.id,
-        if (_evening?.id != null) _evening!.id,
-        ...rotationUsed,
-      };
-      final ranked = await _embeddingService.rank(
-        contextVector,
-        excludeIds: excludeIds,
-      );
-
-      // 3: a small taste of "close to this mood" up front.
       final similar = _embeddingService
           .similarBand(ranked, minPoolSize: 3, maxPoolSize: 3)
           .map((s) => s.reflection)
@@ -516,15 +456,6 @@ class _HomeScreenState extends State<HomeScreen>
         ..shuffle();
       similarBandIds = similar.map((r) => r.id).toSet();
 
-      // NOTE: being offered here is free -- only actually reading one
-      // of these (read-cooldown completing while it's the current
-      // page) marks it headline-rotation-used. See the _readController
-      // status listener in initState.
-
-      // Everything else in the corpus (still excluding both headlines
-      // and the rotation-used set), shuffled, so swiping past the
-      // similar handful leads into fresh, never-repeating material
-      // instead of looping.
       final remainder = ranked
           .where((s) => !similarBandIds.contains(s.reflection.id))
           .map((s) => s.reflection)
@@ -534,7 +465,7 @@ class _HomeScreenState extends State<HomeScreen>
       pool = [...similar, ...remainder];
     } else {
       final all = await _embeddingService.allReflections();
-      pool = List<EmbeddedReflection>.from(all)..shuffle();
+      pool = all.where((r) => !excludeIds.contains(r.id)).toList()..shuffle();
     }
 
     if (!mounted) return;
@@ -571,21 +502,9 @@ class _HomeScreenState extends State<HomeScreen>
       ..forward();
   }
 
-  void _openBrowse() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const BrowseScreen()),
-    );
-  }
-
-  @override
-  void dispose() {
-    _tabController.removeListener(_onTabChanged);
-    _tabController.dispose();
-    _fadeController.dispose();
-    _readController.dispose();
-    _pageController.dispose();
-    super.dispose();
-  }
+  // ---------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
@@ -596,34 +515,11 @@ class _HomeScreenState extends State<HomeScreen>
         foregroundColor: const Color(0xFF3B2E28),
         elevation: 0,
         title: const Text('Daily Reflection'),
-        bottom: _exploring
-            ? null
-            : TabBar(
-                controller: _tabController,
-                labelColor: const Color(0xFF3B2E28),
-                unselectedLabelColor: const Color(0xFF8A6F5C),
-                indicatorColor: const Color(0xFFB5651D),
-                tabs: const [
-                  Tab(text: 'Morning'),
-                  Tab(text: 'Check in'),
-                  Tab(text: 'Evening'),
-                ],
-              ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.location_on_outlined),
-            tooltip: 'Weather location',
-            onPressed: _openWeatherSettings,
-          ),
           IconButton(
             icon: const Icon(Icons.favorite_border),
             tooltip: 'Favorites',
             onPressed: _openFavorites,
-          ),
-          IconButton(
-            icon: const Icon(Icons.history),
-            tooltip: 'History',
-            onPressed: _openHistory,
           ),
           IconButton(
             icon: const Icon(Icons.menu_book_outlined),
@@ -635,12 +531,13 @@ class _HomeScreenState extends State<HomeScreen>
       body: SafeArea(
         child: Column(
           children: [
-            if (!_exploring && _weatherSnapshot != null)
+            if (!_exploring && !_isReadOnlyCarryover) _buildSlotLabel(),
+            if (!_exploring && _weatherSnapshot != null && !_isReadOnlyCarryover)
               WeatherStrip(snapshot: _weatherSnapshot!),
             Expanded(
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 300),
-                child: _exploring ? _buildExploreView() : _buildTabs(),
+                child: _exploring ? _buildExploreView() : _buildSlotBody(),
               ),
             ),
           ],
@@ -649,58 +546,61 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  Widget _buildTabs() {
-    return TabBarView(
-      key: const ValueKey('tabs'),
-      controller: _tabController,
-      children: [
-        AmbientTab(
-          reflection: _morning,
-          loading: _loadingAmbient,
-          unlocked: _isMorningUnlocked,
-          lockedLabel: 'morning',
-          lockedHint: 'Come back after 5:00 AM',
-          lockedIcon: Icons.wb_twilight,
-          fadeAnimation: _fadeAnimation,
-          favoriteIds: _favoriteIds,
-          onToggleFavorite: _toggleFavorite,
-          onReroll: _rerollMorning,
-          canReroll: _canRerollMorning,
-          onExplore: () => _enterExplore(
-            contextTimeId: 'time_morning',
-            contextWeatherId: _morningWeatherId,
+  /// Small caption making it clear which slot is showing, now that
+  /// there's no tab bar doing that job implicitly.
+  Widget _buildSlotLabel() {
+    final label = _currentSlot == ReflectionSlot.morning ? 'Good Morning' : 'Good Evening';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Text(
+          label,
+          style: const TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF8A6F5C),
+            letterSpacing: 0.5,
           ),
         ),
-        OnDemandTab(
-          reflection: _onDemand,
-          loading: _onDemandLoading,
-          favoriteIds: _favoriteIds,
-          onToggleFavorite: _toggleFavorite,
-          onCheckIn: _checkIn,
-        ),
-        AmbientTab(
-          reflection: _evening,
-          loading: _loadingEvening,
-          unlocked: _isEveningUnlocked,
-          lockedLabel: 'evening',
-          lockedHint: 'Come back after 5:00 PM',
-          lockedIcon: Icons.nights_stay_outlined,
-          fadeAnimation: _fadeAnimation,
-          favoriteIds: _favoriteIds,
-          onToggleFavorite: _toggleFavorite,
-          onReroll: _rerollEvening,
-          canReroll: _canRerollEvening,
-          onExplore: () => _enterExplore(
-            contextTimeId: 'time_evening',
-            contextWeatherId: _eveningWeatherId,
-          ),
-        ),
-      ],
+      ),
+    );
+  }
+
+  Widget _buildSlotBody() {
+    // Rare case: pre-5am with no prior Evening pick ever recorded
+    // (first-ever launch before 5am). Nothing to carry over and
+    // nothing to check in for yet -- fall back to the old locked
+    // placeholder rather than an empty screen.
+    if (_isReadOnlyCarryover && _currentReflection == null && !_loading) {
+      return LockedPlaceholder(
+        key: const ValueKey('locked'),
+        label: 'evening',
+        hint: 'Come back after 5:00 PM',
+        icon: Icons.nights_stay_outlined,
+        onExplore: _enterExplore,
+      );
+    }
+
+    return ReflectionSlotView(
+      key: const ValueKey('slot'),
+      reflection: _currentReflection,
+      loading: _loading,
+      needsCheckIn: _needsCheckIn,
+      isReadOnly: _isReadOnlyCarryover,
+      fadeAnimation: _fadeAnimation,
+      favoriteIds: _favoriteIds,
+      onToggleFavorite: _toggleFavorite,
+      onCheckIn: _checkIn,
+      onReroll: _reroll,
+      canReroll: _canReroll,
+      onExplore: _enterExplore,
     );
   }
 
   Widget _buildExploreView() {
     return ExploreView(
+      key: const ValueKey('explore'),
       pool: _explorePool,
       pageController: _pageController,
       readController: _readController,

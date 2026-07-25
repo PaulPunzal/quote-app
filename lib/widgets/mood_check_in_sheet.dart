@@ -2,25 +2,75 @@ import 'package:flutter/material.dart';
 import '../models/context_option.dart';
 import '../services/reflection_embedding_service.dart';
 
-/// A quiet, single-question check-in: "how are you, right now?" —
-/// shown once per day before today's reflection is picked. Options are
-/// loaded live from context_options.json (category: 'mood'), so this
-/// UI can never drift out of sync with what the matcher actually knows
-/// how to compare against.
+/// The three possible outcomes of showing [MoodCheckInSheet], replacing
+/// the old `String?` return value. Overloading null to mean "cancelled"
+/// left no way to express "explicitly skipped" (which should still
+/// trigger a pick — just via the random path, per the no-mood-given
+/// design decision) versus "cancelled" (which should leave whatever
+/// slot called this alone, no pick at all).
 ///
-/// Returns the selected mood's id (e.g. 'mood_tired') via
-/// Navigator.pop, or null if the sheet was dismissed without a choice.
+/// Callers should exhaustively switch over this (sealed class, so the
+/// analyzer will flag a missing case):
+///
+/// ```dart
+/// final result = await MoodCheckInSheet.show(context);
+/// switch (result) {
+///   case MoodPicked(:final moodId):
+///     // rank + pick using moodId
+///   case MoodSkipped():
+///     // random pick, no ranking
+///   case MoodCancelled():
+///     // leave the slot untouched
+/// }
+/// ```
+sealed class MoodCheckInResult {
+  const MoodCheckInResult();
+}
+
+/// A mood chip was selected and confirmed via "Continue".
+class MoodPicked extends MoodCheckInResult {
+  final String moodId;
+  const MoodPicked(this.moodId);
+}
+
+/// User tapped "I don't know" — no mood chip selection is implied or
+/// required. Distinct from [MoodCancelled]: this should still result in
+/// a fresh pick, just via the random path rather than embedding rank.
+class MoodSkipped extends MoodCheckInResult {
+  const MoodSkipped();
+}
+
+/// Sheet was dismissed without an explicit choice. Distinct from
+/// [MoodSkipped]: callers should leave today's slot as-is rather than
+/// picking anything.
+class MoodCancelled extends MoodCheckInResult {
+  const MoodCancelled();
+}
+
+/// A quiet, single-question check-in: "how are you, right now?" —
+/// shown before a slot's reflection is picked, whenever that slot
+/// hasn't been picked yet today. Options are loaded live from
+/// context_options.json (category: 'mood'), so this UI can never drift
+/// out of sync with what the matcher actually knows how to compare
+/// against.
+///
+/// Returns a [MoodCheckInResult] via [show] — see that class's doc for
+/// the three possible outcomes and why they're kept distinct.
 class MoodCheckInSheet extends StatefulWidget {
   final ReflectionEmbeddingService embeddingService;
 
   const MoodCheckInSheet({super.key, required this.embeddingService});
 
-  /// Convenience: shows the sheet and returns the chosen mood id.
-  static Future<String?> show(
+  /// Convenience: shows the sheet and returns the [MoodCheckInResult].
+  /// A dismissal with nothing selected (backdrop tap, back button, or
+  /// any other way `Navigator.pop` ends up called with no value) maps
+  /// to [MoodCancelled] here, so callers never have to treat a bare
+  /// `null` as a fourth, unhandled case.
+  static Future<MoodCheckInResult> show(
     BuildContext context, {
     ReflectionEmbeddingService? embeddingService,
-  }) {
-    return showModalBottomSheet<String>(
+  }) async {
+    final result = await showModalBottomSheet<MoodCheckInResult>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
@@ -30,6 +80,7 @@ class MoodCheckInSheet extends StatefulWidget {
         embeddingService: embeddingService ?? ReflectionEmbeddingService(),
       ),
     );
+    return result ?? const MoodCancelled();
   }
 
   @override
@@ -60,7 +111,11 @@ class _MoodCheckInSheetState extends State<MoodCheckInSheet> {
 
   void _confirm() {
     if (_selectedId == null) return;
-    Navigator.of(context).pop(_selectedId);
+    Navigator.of(context).pop(MoodPicked(_selectedId!));
+  }
+
+  void _skip() {
+    Navigator.of(context).pop(const MoodSkipped());
   }
 
   @override
@@ -127,6 +182,20 @@ class _MoodCheckInSheetState extends State<MoodCheckInSheet> {
                         ),
                       ),
                       child: const Text('Continue'),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // Explicit skip, independent of chip selection — picking
+                  // this always feeds the random path (decision 3),
+                  // regardless of whether a chip happens to be selected.
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton(
+                      onPressed: _skip,
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFF8A6F5C),
+                      ),
+                      child: const Text('I don\'t know — surprise me'),
                     ),
                   ),
                 ],

@@ -1,11 +1,18 @@
 import 'package:flutter/material.dart';
 import '../models/embedded_reflection.dart';
 import '../services/reflection_embedding_service.dart';
+import 'history_screen.dart';
+import 'weather_location_screen.dart';
 
 /// Lists every reflection in assets/reflections.json, with a simple text
 /// search. Replaces the old tag/author-filtered Quote browser — reflections
 /// don't carry manual tags, they're matched by mood/weather/time embeddings
 /// instead, which a filter dropdown can't meaningfully expose.
+///
+/// Also hosts navigation to Weather Location and History — both used to
+/// live as icon buttons on the home screen's app bar; they live here now
+/// so the home screen's app bar stays focused on the daily reflection
+/// itself.
 class BrowseScreen extends StatefulWidget {
   const BrowseScreen({super.key});
 
@@ -42,6 +49,18 @@ class _BrowseScreenState extends State<BrowseScreen> {
     return _all.where((r) => r.text.toLowerCase().contains(q)).toList();
   }
 
+  Future<void> _openWeatherSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const WeatherLocationScreen()),
+    );
+  }
+
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const HistoryScreen()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -51,6 +70,18 @@ class _BrowseScreenState extends State<BrowseScreen> {
         backgroundColor: const Color(0xFFFBF3E9),
         foregroundColor: const Color(0xFF3B2E28),
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.location_on_outlined),
+            tooltip: 'Weather location',
+            onPressed: _openWeatherSettings,
+          ),
+          IconButton(
+            icon: const Icon(Icons.history),
+            tooltip: 'History',
+            onPressed: _openHistory,
+          ),
+        ],
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())

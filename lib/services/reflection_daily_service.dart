@@ -4,19 +4,21 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'reflection_embedding_service.dart';
 import '../models/embedded_reflection.dart';
 
-/// Which "moment" a reflection is being picked for.
+/// Which daily "slot" a reflection is being picked for.
 ///
-/// - [morning] / [evening]: ambient, auto-picked from weather + time only
-///   (no mood check-in). Fixed once assigned for the day.
-/// - [onDemand]: the "how are you, right now?" pick, driven by the mood
-///   check-in. Callers can pass `forceReroll: true` for a fresh pick.
-enum ReflectionSlot { morning, evening, onDemand }
+/// Both slots are now picked with the exact same strategy (see
+/// [ReflectionDailyService] class doc) — mood-dominant ranking when a
+/// mood is supplied, uniform-random when it isn't. There is no longer
+/// a structural difference between them; they're kept as two separate
+/// enum values purely because each needs its own storage key, history,
+/// hard-exclude, and recency tracking (decision: still two slots, not
+/// one reflection per day).
+enum ReflectionSlot { morning, evening }
 
 extension ReflectionSlotKey on ReflectionSlot {
   String get storageKey => switch (this) {
         ReflectionSlot.morning => 'morning',
         ReflectionSlot.evening => 'evening',
-        ReflectionSlot.onDemand => 'ondemand',
       };
 }
 
@@ -32,58 +34,55 @@ class DailyHeadline {
   });
 }
 
-/// Picks and persists reflections for up to three daily "slots" --
-/// morning, evening, and an on-demand mood-driven pick.
+/// Picks and persists reflections for the two daily slots -- morning
+/// and evening.
 ///
-/// MATCHING STRATEGY: a diagnostic against the real embedded corpus
-/// showed only ~10% of reflections were EVER reachable as a
-/// Morning/Evening headline under top-N nearest-neighbor matching --
-/// most reflections are universal/timeless text with no real semantic
-/// relationship to weather or time-of-day, so "best match" always
-/// picked from the same narrow ~30-reflection slice regardless of
-/// actual conditions. That slice was the loop.
+/// PICK STRATEGY (unified across both slots as of this refactor):
+///   - Mood supplied → rank the full corpus against a mood-dominant
+///     context vector (`moodWeight: 2.0, weatherWeight: 0.4,
+///     timeWeight: 0.6` -- previously exclusive to the old on-demand
+///     slot), then pick uniformly at random from the top
+///     `1 - exclusionFraction` of that ranking.
+///   - Mood NOT supplied (explicit skip -- see MoodCheckInResult) →
+///     skip ranking entirely and pick uniformly at random from the
+///     full corpus. Anti-repeat rules (hard-exclude, recency,
+///     rotation) still apply exactly the same either way -- "random"
+///     only means "skip the similarity step," never "skip the
+///     exclusion rules."
 ///
-/// So each slot now:
-///   1. Ranks the full corpus against its context vector.
-///   2. Excludes only the worst-scoring tail (`exclusionFraction`) as
-///      "clearly wrong for this moment" -- a coarse sanity filter,
-///      not a precision picker.
-///   3. Picks uniformly at random from what's left, after hard
-///      exclusion, flexible recency exclusion, and (for headline
-///      slots) rotation exclusion.
+/// Previously, Morning/Evening ("headline") picks used weather+time
+/// only, while a separate on-demand slot used mood+weather+time --
+/// two ranking methods to maintain for what was conceptually the same
+/// operation. That's now one method, `_resolveEligiblePick`, used by
+/// both slots and both the ranked and random paths.
 ///
-/// Weather/time/mood still matter -- a stormy-day reflection is still
-/// less likely to appear on a clear day -- but the large majority of
-/// "timeless" content can now actually rotate through, which top-N
-/// never allowed.
-///
-/// TWO LAYERS OF ANTI-REPEAT, PER SLOT:
+/// TWO LAYERS OF ANTI-REPEAT, PER SLOT (unchanged from before):
 ///
 ///   1. HARD EXCLUDE (`hardExcludeCount`): the last few reflections
 ///      shown for THIS SPECIFIC SLOT are always excluded from that
-///      slot's next pick, no matter what -- this exclusion is unioned
-///      in at EVERY fallback branch below and never relaxed away. This
-///      is what actually guarantees no immediate/short-cycle repeat,
-///      even under pressure (e.g. many "Something else" taps in a
-///      row, or a headline rotation cycle resetting).
+///      slot's next pick, no matter what -- unioned in at every
+///      fallback tier below and never relaxed away. This is the
+///      actual no-repeat guarantee.
 ///
-///   2. FLEXIBLE RECENCY (`recencyWindowDays` / rotation): a wider,
-///      "don't show this too often" layer that IS allowed to relax
-///      when the eligible pool gets too small. Its job is variety
-///      over the medium/long term, not the no-repeat guarantee --
-///      that guarantee lives entirely in layer 1.
+///   2. FLEXIBLE RECENCY (`recencyWindowDays`) + HEADLINE ROTATION
+///      (`_keyHeadlineRotationUsed`): a wider "don't show this too
+///      often" layer, shared across BOTH slots (a reflection shown as
+///      Morning counts against Evening too), that IS allowed to relax
+///      when the eligible pool gets too small. Its job is variety, not
+///      the no-repeat guarantee -- that's entirely layer 1.
 ///
-/// HEADLINE ROTATION (replaces the old time-based cooldown): instead
-/// of barring a headline for N days and hoping that's long enough, we
-/// track the full set of reflection ids that have "had their turn" as
-/// a Morning/Evening headline (or been actually READ -- not merely
-/// offered -- in Explore's "similar to this headline" band). That
-/// used-set is excluded from headline candidates until every
-/// reachable reflection for the current context has had a turn, at
-/// which point the set resets and a new cycle begins. This guarantees
-/// no headline can repeat until the rest of the reachable corpus has
-/// been shown at least once, rather than relying on a fixed number of
-/// days being "probably enough."
+///      Rotation tracks every reflection that's "had its turn" in
+///      either slot (or been actually READ -- not merely offered -- in
+///      Explore's "similar to this headline" band). That used-set is
+///      excluded from candidates until every reachable reflection for
+///      the current context has had a turn, at which point it resets
+///      and a new cycle begins.
+///
+///      This same tiered fallback (recency+rotation+hard-exclude →
+///      rotation+hard-exclude → reset rotation, hard-exclude only →
+///      hard-exclude dropped too as an absolute last resort) now
+///      applies identically whether the pick is mood-ranked or random
+///      -- see `_resolveEligiblePick`.
 class ReflectionDailyService {
   static const _keyAssignedReflections = 'assigned_reflections_v2';
   static const _keyHistory = 'reflection_shown_history';
@@ -91,52 +90,37 @@ class ReflectionDailyService {
 
   final ReflectionEmbeddingService _embeddingService;
 
-  /// Starting size of the flexible recency window for headline slots
-  /// (days). Can shrink under pressure -- see `_rankEligibleHeadlinePool`.
+  /// Flexible recency window (days), shared by both slots. Can shrink
+  /// under pressure -- see `_resolveEligiblePick`'s tier cascade.
   final int recencyWindowDays;
-
-  /// Starting size of the flexible recency window for the on-demand
-  /// slot (days). Kept separate from [recencyWindowDays] and slightly
-  /// longer, since on-demand has no rotation layer behind it -- this
-  /// is its main defense against medium-term repetition.
-  final int onDemandRecencyWindowDays;
 
   /// Non-negotiable: the last [hardExcludeCount] reflections shown for
   /// a given slot are ALWAYS excluded from that slot's next pick, no
   /// matter how much the flexible recency window has to relax under
-  /// pressure. This is what actually guarantees no back-to-back
-  /// repeat -- the flexible window's job is variety, not the
-  /// no-repeat guarantee, since it's allowed to shrink to nothing when
-  /// the eligible pool gets tight.
+  /// pressure.
   final int hardExcludeCount;
 
-  /// Floor below which exclusion/recency gets relaxed rather than
-  /// leaving a near-empty pool to pick from.
+  /// Floor below which the ranked path's top-fraction cutoff gets
+  /// relaxed rather than leaving a near-empty pool to pick from.
   final int minCandidateFloor;
 
   /// Fraction of the ranked corpus excluded as "worst match" before
-  /// picking randomly from the rest. 0.25 for headlines: the bottom
-  /// quarter (least weather/time-relevant) is excluded, the top
-  /// three-quarters are all fair game -- deliberately loose, since
-  /// most of this corpus is timeless and shouldn't be gatekept by a
-  /// weak time/weather signal.
-  final double headlineExclusionFraction;
-
-  /// Tighter than headlines: mood (weighted to dominate below) is a
-  /// more meaningful signal than weather/time turned out to be, so
-  /// it's worth trusting a bit more.
-  final double onDemandExclusionFraction;
+  /// picking randomly from the rest, when a mood context vector is
+  /// available. Only applies to the ranked path -- the random path
+  /// (no mood given) has no scores to cut by, so it filters the whole
+  /// corpus down by exclusion set alone. 0.20 mirrors the old
+  /// on-demand-only value: now that every ranked pick is mood-driven,
+  /// mood's signal is trusted the same way everywhere.
+  final double exclusionFraction;
 
   final Random _random;
 
   ReflectionDailyService({
     ReflectionEmbeddingService? embeddingService,
     this.recencyWindowDays = 14,
-    this.onDemandRecencyWindowDays = 21,
     this.hardExcludeCount = 3,
     this.minCandidateFloor = 15,
-    this.headlineExclusionFraction = 0.25,
-    this.onDemandExclusionFraction = 0.20,
+    this.exclusionFraction = 0.20,
     Random? random,
   })  : _embeddingService = embeddingService ?? ReflectionEmbeddingService(),
         _random = random ?? Random();
@@ -162,6 +146,14 @@ class ReflectionDailyService {
   // Core slot API
   // ---------------------------------------------------------------------
 
+  /// Picks (or loads today's already-picked) reflection for [slot].
+  ///
+  /// [moodId] is optional -- omit it (or pass null) to take the random
+  /// path described in the class doc, e.g. when the person tapped
+  /// "I don't know" on the mood check-in (`MoodSkipped`). This is
+  /// different from the caller not calling this method at all, which
+  /// is the right response to `MoodCancelled` -- that case shouldn't
+  /// reach this method in the first place.
   Future<EmbeddedReflection> getSlotReflection({
     required ReflectionSlot slot,
     String? moodId,
@@ -186,51 +178,47 @@ class ReflectionDailyService {
     }
 
     final resolvedTimeId = timeId ?? timeBucketIdForHour(DateTime.now().hour);
-    final isHeadlineSlot =
-        slot == ReflectionSlot.morning || slot == ReflectionSlot.evening;
 
-    final contextVector = isHeadlineSlot
+    // Mood-ranked path builds a context vector; the random path (no
+    // mood given) skips this entirely -- `_resolveEligiblePick` reads
+    // contextVector == null as "don't rank, just filter and pick."
+    final contextVector = moodId != null
         ? await _embeddingService.buildContextVector(
-            weatherId: weatherId,
-            timeId: resolvedTimeId,
-          )
-        : await _embeddingService.buildContextVector(
             moodId: moodId,
             weatherId: weatherId,
             timeId: resolvedTimeId,
-            // Mood dominates the on-demand pick -- it's the whole
-            // point of "how are you, right now?". Headline slots
-            // already own weather/time as their primary signal.
+            // Mood dominates -- this was previously exclusive to the
+            // on-demand slot, now shared by both slots (decision 2).
             moodWeight: 2.0,
             weatherWeight: 0.4,
             timeWeight: 0.6,
-          );
+          )
+        : null;
 
     final hardExclude = await _hardExcludeIds(prefs, slot);
-
-    final eligible = isHeadlineSlot
-        ? await _rankEligibleHeadlinePool(prefs, contextVector, hardExclude)
-        : await _rankEligibleOnDemandPool(prefs, contextVector, hardExclude);
-
-    final picked = eligible[_random.nextInt(eligible.length)].reflection;
+    final picked = await _resolveEligiblePick(
+      prefs,
+      contextVector: contextVector,
+      hardExclude: hardExclude,
+    );
 
     todaysSlots[slot.storageKey] = picked.id;
     assignedMap[today] = todaysSlots;
     await _saveAssignedMap(prefs, assignedMap);
     await _appendToHistory(prefs, picked.id, today, slot.storageKey);
 
-    if (isHeadlineSlot) {
-      await _markHeadlineRotationUsed(prefs, picked.id);
-    }
+    // Rotation bookkeeping applies to every pick now, ranked or
+    // random -- both slots are "headline" slots (decision 5: kept,
+    // shared across both).
+    await _markHeadlineRotationUsed(prefs, picked.id);
 
     return picked;
   }
 
   /// The last [hardExcludeCount] ids shown for THIS specific slot
-  /// (morning/evening/onDemand tracked separately, since they're
-  /// independent contexts) -- read straight from history, newest
-  /// first. Always honored, never relaxed, at every fallback tier in
-  /// both `_rankEligibleHeadlinePool` and `_rankEligibleOnDemandPool`.
+  /// (morning/evening tracked separately, since they're independent
+  /// contexts) -- read straight from history, newest first. Always
+  /// honored, never relaxed, at every tier in `_resolveEligiblePick`.
   Future<Set<String>> _hardExcludeIds(
     SharedPreferences prefs,
     ReflectionSlot slot,
@@ -244,103 +232,101 @@ class ReflectionDailyService {
         .toSet();
   }
 
-  /// Headline (Morning/Evening) pool. Three tiers, [hardExclude]
-  /// unioned in at every single one so it's never dropped:
+  /// Shared pick resolution for both slots and both strategies
+  /// (mood-ranked when [contextVector] is non-null, random when it's
+  /// null). Replaces the old separate `_rankEligibleHeadlinePool` /
+  /// `_rankEligibleOnDemandPool` methods (decision 2).
+  ///
+  /// Four tiers, [hardExclude] unioned in at every one so it's never
+  /// silently dropped except at the very last resort:
   ///   1. Honor recency + rotation + hard-exclude together.
   ///   2. If that's empty, drop the flexible recency window --
   ///      rotation + hard-exclude is the guarantee that actually
   ///      matters, recency is just a nice-to-have on top.
   ///   3. If STILL empty, the whole reachable corpus for this context
   ///      has had its turn this cycle -- reset rotation and start a
-  ///      fresh cycle from the full corpus, but hard-exclude still
-  ///      stands so the literal thing just shown can't immediately
-  ///      reappear. (This is also what eventually surfaces the
-  ///      handful of reflections that never rank in anyone's top
-  ///      fraction on their own merits: once everything else is
-  ///      excluded, they're what's left.)
-  Future<List<ScoredReflection>> _rankEligibleHeadlinePool(
-    SharedPreferences prefs,
-    List<double> contextVector,
-    Set<String> hardExclude,
-  ) async {
+  ///      fresh cycle, but hard-exclude still stands so the literal
+  ///      thing just shown can't immediately reappear.
+  ///   4. Last resort (corpus smaller than hardExcludeCount+1 --
+  ///      shouldn't happen at normal corpus sizes): drop even
+  ///      hard-exclude rather than leave nothing to pick from.
+  Future<EmbeddedReflection> _resolveEligiblePick(
+    SharedPreferences prefs, {
+    required List<double>? contextVector,
+    required Set<String> hardExclude,
+  }) async {
     var rotationUsed = await _getRotationUsed(prefs);
-    final recentIds = await _recentlyShownIds(prefs, windowDays: recencyWindowDays);
+    final recentIds =
+        await _recentlyShownIds(prefs, windowDays: recencyWindowDays);
 
-    var ranked = await _embeddingService.rank(
+    var pool = await _candidatePool(
       contextVector,
       excludeIds: {...recentIds, ...rotationUsed, ...hardExclude},
     );
-    var pool = _topFraction(ranked, headlineExclusionFraction);
-    if (pool.isNotEmpty) return pool;
+    if (pool.isNotEmpty) return _pickFrom(pool);
 
-    ranked = await _embeddingService.rank(
+    pool = await _candidatePool(
       contextVector,
       excludeIds: {...rotationUsed, ...hardExclude},
     );
-    pool = _topFraction(ranked, headlineExclusionFraction);
-    if (pool.isNotEmpty) return pool;
+    if (pool.isNotEmpty) return _pickFrom(pool);
 
     // Full cycle exhausted for this context -- everyone's had a turn.
     // Reset rotation; hard-exclude still stands.
     rotationUsed = {};
     await _saveRotationUsed(prefs, rotationUsed);
-    ranked = await _embeddingService.rank(contextVector, excludeIds: hardExclude);
-    pool = _topFraction(ranked, headlineExclusionFraction);
-    if (pool.isNotEmpty) return pool;
+    pool = await _candidatePool(contextVector, excludeIds: hardExclude);
+    if (pool.isNotEmpty) return _pickFrom(pool);
 
-    // Last resort (corpus smaller than hardExcludeCount+1 -- shouldn't
-    // happen at 300 reflections, but never return an empty list): drop
-    // even hard-exclude rather than crash on eligible[random.nextInt(0)].
-    ranked = await _embeddingService.rank(contextVector);
-    return _topFraction(ranked, headlineExclusionFraction);
+    // Last resort: drop hard-exclude too rather than have nothing to
+    // pick from.
+    pool = await _candidatePool(contextVector, excludeIds: const {});
+    return _pickFrom(pool);
   }
 
-  /// On-demand pool: flexible recency window that can relax under
-  /// pressure (e.g. many "Something else" taps in a row), but
-  /// [hardExclude] is unioned in at EVERY step regardless -- so even
-  /// once the flexible window relaxes all the way to nothing, the
-  /// last few on-demand picks still can't repeat back-to-back.
-  Future<List<ScoredReflection>> _rankEligibleOnDemandPool(
-    SharedPreferences prefs,
-    List<double> contextVector,
-    Set<String> hardExclude,
-  ) async {
-    var window = onDemandRecencyWindowDays;
-
-    while (true) {
-      final recentIds = await _recentlyShownIds(prefs, windowDays: window);
-      final ranked = await _embeddingService.rank(
-        contextVector,
-        excludeIds: {...recentIds, ...hardExclude},
-      );
-      final eligible = _topFraction(ranked, onDemandExclusionFraction);
-
-      if (eligible.length >= minCandidateFloor || window <= 0) {
-        if (eligible.isNotEmpty) return eligible;
-        // Last resort, mirrors the headline path above: never return
-        // an empty list, even if that means dropping hard-exclude in
-        // the pathological case of a near-empty corpus.
-        final fallbackRanked = await _embeddingService.rank(contextVector);
-        return _topFraction(fallbackRanked, onDemandExclusionFraction);
-      }
-      window = window ~/ 2;
+  /// Builds one tier's candidate list:
+  ///   - [contextVector] non-null → rank the corpus against it, keep
+  ///     the top [exclusionFraction]-adjusted slice (via
+  ///     `_topFraction`), excluding [excludeIds].
+  ///   - [contextVector] null → the random path: just the corpus minus
+  ///     [excludeIds], no ranking or scoring at all.
+  Future<List<EmbeddedReflection>> _candidatePool(
+    List<double>? contextVector, {
+    required Set<String> excludeIds,
+  }) async {
+    if (contextVector == null) {
+      final all = await _embeddingService.allReflections();
+      return all.where((r) => !excludeIds.contains(r.id)).toList();
     }
+
+    final ranked = await _embeddingService.rank(
+      contextVector,
+      excludeIds: excludeIds,
+    );
+    return _topFraction(ranked, exclusionFraction)
+        .map((s) => s.reflection)
+        .toList();
+  }
+
+  EmbeddedReflection _pickFrom(List<EmbeddedReflection> pool) {
+    return pool[_random.nextInt(pool.length)];
   }
 
   /// Keeps the top (1 - [exclusionFraction]) of [ranked], but never
   /// fewer than [minCandidateFloor] (or the whole list, if smaller).
   List<ScoredReflection> _topFraction(
     List<ScoredReflection> ranked,
-    double exclusionFraction,
+    double fraction,
   ) {
     if (ranked.isEmpty) return ranked;
-    final byFraction = (ranked.length * (1 - exclusionFraction)).ceil();
+    final byFraction = (ranked.length * (1 - fraction)).ceil();
     final count = max(byFraction, min(minCandidateFloor, ranked.length));
     return ranked.take(count).toList();
   }
 
   // ---------------------------------------------------------------------
-  // Headline rotation (replaces the old day-based cooldown)
+  // Headline rotation (shared across both slots -- decision 5, unchanged
+  // mechanism from before this refactor)
   // ---------------------------------------------------------------------
 
   Future<Set<String>> _getRotationUsed(SharedPreferences prefs) async {
@@ -364,7 +350,7 @@ class ReflectionDailyService {
   }
 
   /// Public entry point for HomeScreen to mark a reflection as having
-  /// had its headline turn when it's actually READ (not merely
+  /// had its rotation turn when it's actually READ (not merely
   /// offered) in Explore's "similar to this headline" band.
   Future<void> markHeadlineRotationUsed(String id) async {
     final prefs = await SharedPreferences.getInstance();
@@ -381,6 +367,8 @@ class ReflectionDailyService {
     return _getRotationUsed(prefs);
   }
 
+  /// [moodId] omitted (or null) takes the random path -- see class doc
+  /// and `getSlotReflection`.
   Future<EmbeddedReflection> rerollSlot({
     required ReflectionSlot slot,
     String? moodId,
@@ -405,6 +393,26 @@ class ReflectionDailyService {
     final prefs = await SharedPreferences.getInstance();
     final assignedMap = await _getAssignedMap(prefs);
     final existingId = assignedMap[_todayString()]?[slot.storageKey];
+    if (existingId == null) return null;
+
+    final all = await _embeddingService.allReflections();
+    final existing = all.where((r) => r.id == existingId);
+    return existing.isNotEmpty ? existing.first : null;
+  }
+
+  /// Loads today's assignment for [slot] on an arbitrary [date] (format
+  /// `yyyy-MM-dd`), not just today. Added for the pre-5am case
+  /// (decision 6): showing "yesterday's already-picked Evening"
+  /// requires reading a slot for a date other than today, which the
+  /// existing [getSlotIfAssigned] can't do since it's hardcoded to
+  /// `_todayString()`.
+  Future<EmbeddedReflection?> getSlotForDate(
+    ReflectionSlot slot,
+    String date,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final assignedMap = await _getAssignedMap(prefs);
+    final existingId = assignedMap[date]?[slot.storageKey];
     if (existingId == null) return null;
 
     final all = await _embeddingService.allReflections();
