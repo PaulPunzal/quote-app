@@ -5,7 +5,8 @@ import 'locked_placeholder.dart';
 import 'quiet_loading_dot.dart';
 
 /// One of the Morning/Evening tabs: a single ambient reflection, locked
-/// until its time-of-day window opens, with a way to jump into Explore.
+/// until its time-of-day window opens, with a way to reroll it, or
+/// jump into Explore.
 class AmbientTab extends StatelessWidget {
   final EmbeddedReflection? reflection;
   final bool loading;
@@ -17,6 +18,8 @@ class AmbientTab extends StatelessWidget {
   final Set<String> favoriteIds;
   final ValueChanged<String> onToggleFavorite;
   final VoidCallback onExplore;
+  final VoidCallback onReroll;
+  final bool canReroll; // NEW: false during the post-reroll cooldown
 
   const AmbientTab({
     super.key,
@@ -30,6 +33,8 @@ class AmbientTab extends StatelessWidget {
     required this.favoriteIds,
     required this.onToggleFavorite,
     required this.onExplore,
+    required this.onReroll,
+    required this.canReroll,
   });
 
   @override
@@ -52,19 +57,34 @@ class AmbientTab extends StatelessWidget {
     return Column(
       children: [
         Expanded(
-          child: Center(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: FadeTransition(
-                opacity: fadeAnimation,
-                child: FavoritableReflection(
-                  reflectionId: current.id,
-                  text: current.text,
-                  isFavorite: favoriteIds.contains(current.id),
-                  onToggleFavorite: onToggleFavorite,
+          child: Stack(
+            children: [
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 32),
+                  child: FadeTransition(
+                    opacity: fadeAnimation,
+                    child: FavoritableReflection(
+                      reflectionId: current.id,
+                      text: current.text,
+                      isFavorite: favoriteIds.contains(current.id),
+                      onToggleFavorite: onToggleFavorite,
+                    ),
+                  ),
                 ),
               ),
-            ),
+              Positioned(
+                top: 4,
+                right: 4,
+                child: IconButton(
+                  onPressed: canReroll ? onReroll : null,
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Show me another',
+                  color: const Color(0xFF8A6F5C),
+                  disabledColor: const Color(0xFFD8C3AE),
+                ),
+              ),
+            ],
           ),
         ),
         Padding(

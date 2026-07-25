@@ -20,8 +20,11 @@ import 'widgets/weather_strip.dart';
 ///   - Morning / Evening: ambient picks, auto-assigned from weather + a
 ///     fixed time-of-day context (not the current clock — see
 ///     ReflectionDailyService.getSlotReflection's `timeId` doc). Fixed
-///     for the day once picked, same as the old single-reflection
-///     behavior.
+///     for the day once picked, but can be manually rerolled (subject
+///     to a short per-tab cooldown) via the small refresh icon over the
+///     reflection -- rerolling reuses that tab's already-fetched
+///     weather reading rather than fetching fresh, since "not this one"
+///     is a different intent than "conditions changed."
 ///
 ///     Morning is picked the moment the app is opened (whenever that
 ///     is). Evening is picked lazily — the first time the Evening tab
@@ -38,6 +41,10 @@ import 'widgets/weather_strip.dart';
 ///
 /// Explore mode (shuffle through everything) is unchanged conceptually,
 /// just reachable from any tab instead of being tied to one reflection.
+/// Because it's entered by reading whichever reflection is currently
+/// assigned to that tab's state field, a manual reroll of Morning or
+/// Evening is automatically reflected the next time Explore is entered
+/// from that tab -- no extra plumbing needed.
 ///
 /// This class owns all state and business logic; the actual tab/explore
 /// bodies live in sibling files under widgets/ so this file doesn't have
@@ -75,11 +82,21 @@ class _HomeScreenState extends State<HomeScreen>
 
   /// The weatherId actually used (or attempted) the moment each ambient
   /// slot's weather was fetched. Kept purely so "See other reflections"
-  /// can rank its pool against the same weather+time context the
-  /// currently-shown reflection was picked from, instead of shuffling
-  /// every reflection with no context at all.
+  /// (and manual rerolls) can rank against the same weather+time
+  /// context the currently-shown reflection was picked from, instead of
+  /// re-fetching weather or ranking with no context at all.
   String? _morningWeatherId;
   String? _eveningWeatherId;
+
+  /// Per-tab manual-reroll cooldown flags. False for [_rerollCooldown]
+  /// after a reroll, to prevent rapid-fire tapping; independent per
+  /// tab since morning/evening are separate contexts. This is purely a
+  /// tap-rate limiter -- the actual "can't repeat the same reflection"
+  /// guarantee lives in ReflectionDailyService's hard-exclude layer and
+  /// applies regardless of how long you wait between rerolls.
+  bool _canRerollMorning = true;
+  bool _canRerollEvening = true;
+  static const Duration _rerollCooldown = Duration(seconds: 3);
 
   Set<String> _favoriteIds = {};
 
@@ -92,10 +109,17 @@ class _HomeScreenState extends State<HomeScreen>
   late final AnimationController _fadeController;
   late final Animation<double> _fadeAnimation;
 
-  // --- Explore mode state (unchanged from before) ---
+  // --- Explore mode state ---
   bool _exploring = false;
   final PageController _pageController = PageController();
   List<EmbeddedReflection> _explorePool = [];
+
+  /// Ids currently offered in Explore's "similar to this headline"
+  /// band. Being included here doesn't cost a reflection its headline
+  /// rotation turn on its own -- only actually reading it (read-
+  /// cooldown completing while it's the current page) does. See the
+  /// _readController status listener below.
+  Set<String> _similarBandIds = {};
 
   static const Duration _readCooldown = Duration(seconds: 3);
   late final AnimationController _readController;
@@ -146,11 +170,22 @@ class _HomeScreenState extends State<HomeScreen>
       vsync: this,
       duration: _readCooldown,
     )..addStatusListener((status) {
-        if (status == AnimationStatus.completed && mounted) {
-          setState(() {
-            _canAdvance = true;
-            _readIndices.add(_currentExploreIndex);
-          });
+        if (status != AnimationStatus.completed || !mounted) return;
+
+        setState(() {
+          _canAdvance = true;
+          _readIndices.add(_currentExploreIndex);
+        });
+
+        // Only counts as "used" once actually read (cooldown
+        // completed while it's the current page), not merely offered
+        // in the pool -- so scrolling straight past something in
+        // Explore doesn't cost it its headline rotation turn.
+        if (_currentExploreIndex < _explorePool.length) {
+          final currentId = _explorePool[_currentExploreIndex].id;
+          if (_similarBandIds.contains(currentId)) {
+            _dailyService.markHeadlineRotationUsed(currentId);
+          }
         }
       });
 
@@ -332,6 +367,60 @@ class _HomeScreenState extends State<HomeScreen>
     });
   }
 
+  /// Manually rerolls today's Morning reflection. Reuses
+  /// [_morningWeatherId] (the weather reading already fetched for
+  /// morning) rather than fetching fresh -- rerolling means "not this
+  /// one," not "conditions changed since I opened the app." Guarded by
+  /// [_canRerollMorning] so rapid taps are ignored; the underlying
+  /// service-layer hard-exclude guarantees the just-shown reflection
+  /// can't come back regardless of cooldown timing.
+  Future<void> _rerollMorning() async {
+    if (!_canRerollMorning) return;
+    setState(() {
+      _loadingAmbient = true;
+      _canRerollMorning = false;
+    });
+
+    final rerolled = await _dailyService.rerollSlot(
+      slot: ReflectionSlot.morning,
+      weatherId: _morningWeatherId,
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _morning = rerolled;
+      _loadingAmbient = false;
+    });
+
+    Future.delayed(_rerollCooldown, () {
+      if (mounted) setState(() => _canRerollMorning = true);
+    });
+  }
+
+  /// Same idea as [_rerollMorning], for Evening.
+  Future<void> _rerollEvening() async {
+    if (!_canRerollEvening) return;
+    setState(() {
+      _loadingEvening = true;
+      _canRerollEvening = false;
+    });
+
+    final rerolled = await _dailyService.rerollSlot(
+      slot: ReflectionSlot.evening,
+      weatherId: _eveningWeatherId,
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _evening = rerolled;
+      _loadingEvening = false;
+    });
+
+    Future.delayed(_rerollCooldown, () {
+      if (mounted) setState(() => _canRerollEvening = true);
+    });
+  }
+
   /// If the on-demand slot was already picked earlier today (e.g.
   /// reopening the app), show it without prompting for mood again.
   Future<void> _loadExistingOnDemand() async {
@@ -384,6 +473,10 @@ class _HomeScreenState extends State<HomeScreen>
   /// shuffled, so there's always something new to swipe to without
   /// ever repeating (no looping back to the start).
   ///
+  /// Because [_morning]/[_evening] are read here at call time, this
+  /// always reflects whichever reflection is currently assigned to
+  /// that tab -- including one that was just manually rerolled.
+  ///
   /// [contextTimeId] is omitted only if Explore is ever entered without
   /// a specific ambient tab in mind, in which case it falls back to a
   /// fully random shuffle over everything (the old behavior).
@@ -392,6 +485,7 @@ class _HomeScreenState extends State<HomeScreen>
     String? contextWeatherId,
   }) async {
     List<EmbeddedReflection> pool;
+    Set<String> similarBandIds = {};
 
     if (contextTimeId != null) {
       final contextVector = await _embeddingService.buildContextVector(
@@ -399,42 +493,40 @@ class _HomeScreenState extends State<HomeScreen>
         timeId: contextTimeId,
       );
 
-      // Exclude BOTH headlines, not just the tab Explore was opened
-      // from -- otherwise Evening's pick can still surface as an
-      // "other reflection" while exploring from Morning (and vice
-      // versa), which still reads as a repeat.
+      // Exclude BOTH today's literal headlines AND the full headline
+      // rotation "used" set -- so a reflection that's already had its
+      // headline turn this cycle can't even be offered in the similar
+      // band, not just excluded from being re-picked outright.
+      final rotationUsed = await _dailyService.getHeadlineRotationUsedIds();
       final excludeIds = <String>{
         if (_morning?.id != null) _morning!.id,
         if (_evening?.id != null) _evening!.id,
+        ...rotationUsed,
       };
       final ranked = await _embeddingService.rank(
         contextVector,
         excludeIds: excludeIds,
       );
 
-      // 3 (was 5): a smaller taste of "close to this mood" up front,
-      // and less for headline cooldown to sideline every time Explore
-      // is opened -- see recordSimilarBandShown below.
+      // 3: a small taste of "close to this mood" up front.
       final similar = _embeddingService
           .similarBand(ranked, minPoolSize: 3, maxPoolSize: 3)
           .map((s) => s.reflection)
           .toList()
         ..shuffle();
-      final similarIds = similar.map((r) => r.id).toSet();
+      similarBandIds = similar.map((r) => r.id).toSet();
 
-      // Being shown here counts the same as being picked as a
-      // headline, for cooldown purposes -- otherwise a reflection
-      // could bounce between "shown in Explore" and "picked as
-      // tomorrow's headline" indefinitely without ever actually
-      // resting.
-      await _dailyService
-          .recordSimilarBandShown(similar.map((r) => r.id).toList());
+      // NOTE: being offered here is free -- only actually reading one
+      // of these (read-cooldown completing while it's the current
+      // page) marks it headline-rotation-used. See the _readController
+      // status listener in initState.
 
-      // Everything else in the corpus (still excluding both
-      // headlines), shuffled, so swiping past the similar handful
-      // leads into fresh, never-repeating material instead of looping.
+      // Everything else in the corpus (still excluding both headlines
+      // and the rotation-used set), shuffled, so swiping past the
+      // similar handful leads into fresh, never-repeating material
+      // instead of looping.
       final remainder = ranked
-          .where((s) => !similarIds.contains(s.reflection.id))
+          .where((s) => !similarBandIds.contains(s.reflection.id))
           .map((s) => s.reflection)
           .toList()
         ..shuffle();
@@ -448,6 +540,7 @@ class _HomeScreenState extends State<HomeScreen>
     if (!mounted) return;
     setState(() {
       _explorePool = pool;
+      _similarBandIds = similarBandIds;
       _exploring = true;
       _currentExploreIndex = 0;
       _readIndices.clear();
@@ -479,10 +572,6 @@ class _HomeScreenState extends State<HomeScreen>
   }
 
   void _openBrowse() {
-    // BrowseScreen already reads from the embedded reflections
-    // (assets/reflections.json via ReflectionEmbeddingService), not the
-    // old tagged Quote model -- that migration already happened, this
-    // comment used to say otherwise and was just stale.
     Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const BrowseScreen()),
     );
@@ -575,6 +664,8 @@ class _HomeScreenState extends State<HomeScreen>
           fadeAnimation: _fadeAnimation,
           favoriteIds: _favoriteIds,
           onToggleFavorite: _toggleFavorite,
+          onReroll: _rerollMorning,
+          canReroll: _canRerollMorning,
           onExplore: () => _enterExplore(
             contextTimeId: 'time_morning',
             contextWeatherId: _morningWeatherId,
@@ -597,6 +688,8 @@ class _HomeScreenState extends State<HomeScreen>
           fadeAnimation: _fadeAnimation,
           favoriteIds: _favoriteIds,
           onToggleFavorite: _toggleFavorite,
+          onReroll: _rerollEvening,
+          canReroll: _canRerollEvening,
           onExplore: () => _enterExplore(
             contextTimeId: 'time_evening',
             contextWeatherId: _eveningWeatherId,

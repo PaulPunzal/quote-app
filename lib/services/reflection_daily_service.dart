@@ -48,30 +48,69 @@ class DailyHeadline {
 ///   2. Excludes only the worst-scoring tail (`exclusionFraction`) as
 ///      "clearly wrong for this moment" -- a coarse sanity filter,
 ///      not a precision picker.
-///   3. Picks uniformly at random from what's left, after recency
-///      exclusion and (for headline slots) cooldown exclusion.
+///   3. Picks uniformly at random from what's left, after hard
+///      exclusion, flexible recency exclusion, and (for headline
+///      slots) rotation exclusion.
 ///
 /// Weather/time/mood still matter -- a stormy-day reflection is still
 /// less likely to appear on a clear day -- but the large majority of
 /// "timeless" content can now actually rotate through, which top-N
 /// never allowed.
+///
+/// TWO LAYERS OF ANTI-REPEAT, PER SLOT:
+///
+///   1. HARD EXCLUDE (`hardExcludeCount`): the last few reflections
+///      shown for THIS SPECIFIC SLOT are always excluded from that
+///      slot's next pick, no matter what -- this exclusion is unioned
+///      in at EVERY fallback branch below and never relaxed away. This
+///      is what actually guarantees no immediate/short-cycle repeat,
+///      even under pressure (e.g. many "Something else" taps in a
+///      row, or a headline rotation cycle resetting).
+///
+///   2. FLEXIBLE RECENCY (`recencyWindowDays` / rotation): a wider,
+///      "don't show this too often" layer that IS allowed to relax
+///      when the eligible pool gets too small. Its job is variety
+///      over the medium/long term, not the no-repeat guarantee --
+///      that guarantee lives entirely in layer 1.
+///
+/// HEADLINE ROTATION (replaces the old time-based cooldown): instead
+/// of barring a headline for N days and hoping that's long enough, we
+/// track the full set of reflection ids that have "had their turn" as
+/// a Morning/Evening headline (or been actually READ -- not merely
+/// offered -- in Explore's "similar to this headline" band). That
+/// used-set is excluded from headline candidates until every
+/// reachable reflection for the current context has had a turn, at
+/// which point the set resets and a new cycle begins. This guarantees
+/// no headline can repeat until the rest of the reachable corpus has
+/// been shown at least once, rather than relying on a fixed number of
+/// days being "probably enough."
 class ReflectionDailyService {
   static const _keyAssignedReflections = 'assigned_reflections_v2';
   static const _keyHistory = 'reflection_shown_history';
-  static const _keySimilarBandHistory = 'explore_similar_band_history';
+  static const _keyHeadlineRotationUsed = 'headline_rotation_used_ids';
 
   final ReflectionEmbeddingService _embeddingService;
+
+  /// Starting size of the flexible recency window for headline slots
+  /// (days). Can shrink under pressure -- see `_rankEligibleHeadlinePool`.
   final int recencyWindowDays;
 
-  /// How long a reflection is barred from headline duty after being
-  /// shown as one, OR after being offered in Explore's "similar" band.
-  /// Now mostly a safety net rather than the primary anti-repeat
-  /// mechanism -- see class doc -- since the eligible pool is large
-  /// enough that plain randomness does most of the work.
-  final int headlineCooldownDays;
-  final int exploreCooldownDays;
+  /// Starting size of the flexible recency window for the on-demand
+  /// slot (days). Kept separate from [recencyWindowDays] and slightly
+  /// longer, since on-demand has no rotation layer behind it -- this
+  /// is its main defense against medium-term repetition.
+  final int onDemandRecencyWindowDays;
 
-  /// Floor below which exclusion/cooldown gets relaxed rather than
+  /// Non-negotiable: the last [hardExcludeCount] reflections shown for
+  /// a given slot are ALWAYS excluded from that slot's next pick, no
+  /// matter how much the flexible recency window has to relax under
+  /// pressure. This is what actually guarantees no back-to-back
+  /// repeat -- the flexible window's job is variety, not the
+  /// no-repeat guarantee, since it's allowed to shrink to nothing when
+  /// the eligible pool gets tight.
+  final int hardExcludeCount;
+
+  /// Floor below which exclusion/recency gets relaxed rather than
   /// leaving a near-empty pool to pick from.
   final int minCandidateFloor;
 
@@ -93,8 +132,8 @@ class ReflectionDailyService {
   ReflectionDailyService({
     ReflectionEmbeddingService? embeddingService,
     this.recencyWindowDays = 14,
-    this.headlineCooldownDays = 30,
-    this.exploreCooldownDays = 30,
+    this.onDemandRecencyWindowDays = 21,
+    this.hardExcludeCount = 3,
     this.minCandidateFloor = 15,
     this.headlineExclusionFraction = 0.25,
     this.onDemandExclusionFraction = 0.20,
@@ -167,17 +206,11 @@ class ReflectionDailyService {
             timeWeight: 0.6,
           );
 
-    final cooldownIds =
-        isHeadlineSlot ? await _headlineCooldownIds(prefs) : <String>{};
-    final exclusionFraction =
-        isHeadlineSlot ? headlineExclusionFraction : onDemandExclusionFraction;
+    final hardExclude = await _hardExcludeIds(prefs, slot);
 
-    final eligible = await _rankEligiblePool(
-      prefs,
-      contextVector,
-      cooldownIds: cooldownIds,
-      exclusionFraction: exclusionFraction,
-    );
+    final eligible = isHeadlineSlot
+        ? await _rankEligibleHeadlinePool(prefs, contextVector, hardExclude)
+        : await _rankEligibleOnDemandPool(prefs, contextVector, hardExclude);
 
     final picked = eligible[_random.nextInt(eligible.length)].reflection;
 
@@ -186,43 +219,110 @@ class ReflectionDailyService {
     await _saveAssignedMap(prefs, assignedMap);
     await _appendToHistory(prefs, picked.id, today, slot.storageKey);
 
+    if (isHeadlineSlot) {
+      await _markHeadlineRotationUsed(prefs, picked.id);
+    }
+
     return picked;
   }
 
-  /// Ranks [contextVector] against the corpus, excluding recently-shown
-  /// ids (progressively relaxed) and [cooldownIds], then keeps
-  /// everything except the bottom [exclusionFraction] of what's left --
-  /// a loose "not clearly wrong" filter rather than a "best match"
-  /// filter. Drops [cooldownIds] entirely as a last resort only if
-  /// even a fully-relaxed recency window isn't enough to clear
-  /// [minCandidateFloor].
-  Future<List<ScoredReflection>> _rankEligiblePool(
+  /// The last [hardExcludeCount] ids shown for THIS specific slot
+  /// (morning/evening/onDemand tracked separately, since they're
+  /// independent contexts) -- read straight from history, newest
+  /// first. Always honored, never relaxed, at every fallback tier in
+  /// both `_rankEligibleHeadlinePool` and `_rankEligibleOnDemandPool`.
+  Future<Set<String>> _hardExcludeIds(
     SharedPreferences prefs,
-    List<double> contextVector, {
-    Set<String> cooldownIds = const {},
-    required double exclusionFraction,
-  }) async {
-    var window = recencyWindowDays;
+    ReflectionSlot slot,
+  ) async {
+    final history = await _getHistory(prefs);
+    final slotHistory =
+        history.where((e) => e['slot'] == slot.storageKey).toList();
+    return slotHistory.reversed
+        .take(hardExcludeCount)
+        .map((e) => e['id']!)
+        .toSet();
+  }
+
+  /// Headline (Morning/Evening) pool. Three tiers, [hardExclude]
+  /// unioned in at every single one so it's never dropped:
+  ///   1. Honor recency + rotation + hard-exclude together.
+  ///   2. If that's empty, drop the flexible recency window --
+  ///      rotation + hard-exclude is the guarantee that actually
+  ///      matters, recency is just a nice-to-have on top.
+  ///   3. If STILL empty, the whole reachable corpus for this context
+  ///      has had its turn this cycle -- reset rotation and start a
+  ///      fresh cycle from the full corpus, but hard-exclude still
+  ///      stands so the literal thing just shown can't immediately
+  ///      reappear. (This is also what eventually surfaces the
+  ///      handful of reflections that never rank in anyone's top
+  ///      fraction on their own merits: once everything else is
+  ///      excluded, they're what's left.)
+  Future<List<ScoredReflection>> _rankEligibleHeadlinePool(
+    SharedPreferences prefs,
+    List<double> contextVector,
+    Set<String> hardExclude,
+  ) async {
+    var rotationUsed = await _getRotationUsed(prefs);
+    final recentIds = await _recentlyShownIds(prefs, windowDays: recencyWindowDays);
+
+    var ranked = await _embeddingService.rank(
+      contextVector,
+      excludeIds: {...recentIds, ...rotationUsed, ...hardExclude},
+    );
+    var pool = _topFraction(ranked, headlineExclusionFraction);
+    if (pool.isNotEmpty) return pool;
+
+    ranked = await _embeddingService.rank(
+      contextVector,
+      excludeIds: {...rotationUsed, ...hardExclude},
+    );
+    pool = _topFraction(ranked, headlineExclusionFraction);
+    if (pool.isNotEmpty) return pool;
+
+    // Full cycle exhausted for this context -- everyone's had a turn.
+    // Reset rotation; hard-exclude still stands.
+    rotationUsed = {};
+    await _saveRotationUsed(prefs, rotationUsed);
+    ranked = await _embeddingService.rank(contextVector, excludeIds: hardExclude);
+    pool = _topFraction(ranked, headlineExclusionFraction);
+    if (pool.isNotEmpty) return pool;
+
+    // Last resort (corpus smaller than hardExcludeCount+1 -- shouldn't
+    // happen at 300 reflections, but never return an empty list): drop
+    // even hard-exclude rather than crash on eligible[random.nextInt(0)].
+    ranked = await _embeddingService.rank(contextVector);
+    return _topFraction(ranked, headlineExclusionFraction);
+  }
+
+  /// On-demand pool: flexible recency window that can relax under
+  /// pressure (e.g. many "Something else" taps in a row), but
+  /// [hardExclude] is unioned in at EVERY step regardless -- so even
+  /// once the flexible window relaxes all the way to nothing, the
+  /// last few on-demand picks still can't repeat back-to-back.
+  Future<List<ScoredReflection>> _rankEligibleOnDemandPool(
+    SharedPreferences prefs,
+    List<double> contextVector,
+    Set<String> hardExclude,
+  ) async {
+    var window = onDemandRecencyWindowDays;
 
     while (true) {
       final recentIds = await _recentlyShownIds(prefs, windowDays: window);
       final ranked = await _embeddingService.rank(
         contextVector,
-        excludeIds: {...recentIds, ...cooldownIds},
+        excludeIds: {...recentIds, ...hardExclude},
       );
-      final eligible = _topFraction(ranked, exclusionFraction);
+      final eligible = _topFraction(ranked, onDemandExclusionFraction);
 
       if (eligible.length >= minCandidateFloor || window <= 0) {
-        if (eligible.length >= minCandidateFloor || cooldownIds.isEmpty) {
-          return eligible;
-        }
-        final fallbackRanked = await _embeddingService.rank(
-          contextVector,
-          excludeIds: recentIds,
-        );
-        return _topFraction(fallbackRanked, exclusionFraction);
+        if (eligible.isNotEmpty) return eligible;
+        // Last resort, mirrors the headline path above: never return
+        // an empty list, even if that means dropping hard-exclude in
+        // the pathological case of a near-empty corpus.
+        final fallbackRanked = await _embeddingService.rank(contextVector);
+        return _topFraction(fallbackRanked, onDemandExclusionFraction);
       }
-
       window = window ~/ 2;
     }
   }
@@ -239,68 +339,46 @@ class ReflectionDailyService {
     return ranked.take(count).toList();
   }
 
-  Future<Set<String>> _headlineCooldownIds(SharedPreferences prefs) async {
-    final ids = <String>{};
+  // ---------------------------------------------------------------------
+  // Headline rotation (replaces the old day-based cooldown)
+  // ---------------------------------------------------------------------
 
-    final history = await _getHistory(prefs);
-    final headlineCutoff =
-        DateTime.now().subtract(Duration(days: headlineCooldownDays));
-    for (final entry in history) {
-      final slot = entry['slot'];
-      if (slot != ReflectionSlot.morning.storageKey &&
-          slot != ReflectionSlot.evening.storageKey) {
-        continue;
-      }
-      final date = DateTime.tryParse(entry['date'] ?? '');
-      if (date != null && date.isAfter(headlineCutoff)) {
-        ids.add(entry['id']!);
-      }
-    }
-
-    final similarShown = await _getSimilarBandHistory(prefs);
-    final exploreCutoff =
-        DateTime.now().subtract(Duration(days: exploreCooldownDays));
-    for (final entry in similarShown) {
-      final date = DateTime.tryParse(entry['date'] ?? '');
-      if (date != null && date.isAfter(exploreCutoff)) {
-        ids.add(entry['id']!);
-      }
-    }
-
-    return ids;
+  Future<Set<String>> _getRotationUsed(SharedPreferences prefs) async {
+    return (prefs.getStringList(_keyHeadlineRotationUsed) ?? const []).toSet();
   }
 
-  Future<List<Map<String, String>>> _getSimilarBandHistory(
-      SharedPreferences prefs) async {
-    final raw = prefs.getString(_keySimilarBandHistory);
-    if (raw == null) return [];
-    final decoded = jsonDecode(raw) as List<dynamic>;
-    return decoded
-        .map((e) => (e as Map<String, dynamic>)
-            .map((k, v) => MapEntry(k, v.toString())))
-        .toList();
+  Future<void> _saveRotationUsed(
+    SharedPreferences prefs,
+    Set<String> ids,
+  ) async {
+    await prefs.setStringList(_keyHeadlineRotationUsed, ids.toList());
   }
 
-  /// Records that [ids] were just offered as Explore's "similar to
-  /// this headline" band. Called regardless of whether the user swipes
-  /// to any of them -- being shown there and being picked both count
-  /// as "seen" for headline cooldown purposes. Only called from the
-  /// ambient (Morning/Evening) entry point into Explore.
-  Future<void> recordSimilarBandShown(List<String> ids) async {
-    if (ids.isEmpty) return;
+  Future<void> _markHeadlineRotationUsed(
+    SharedPreferences prefs,
+    String id,
+  ) async {
+    final used = await _getRotationUsed(prefs);
+    used.add(id);
+    await _saveRotationUsed(prefs, used);
+  }
+
+  /// Public entry point for HomeScreen to mark a reflection as having
+  /// had its headline turn when it's actually READ (not merely
+  /// offered) in Explore's "similar to this headline" band.
+  Future<void> markHeadlineRotationUsed(String id) async {
     final prefs = await SharedPreferences.getInstance();
-    final history = await _getSimilarBandHistory(prefs);
-    final today = _todayString();
-    for (final id in ids) {
-      history.add({'id': id, 'date': today});
-    }
-    final cutoff = DateTime.now().subtract(
-        Duration(days: max(headlineCooldownDays, exploreCooldownDays) + 7));
-    final trimmed = history.where((entry) {
-      final date = DateTime.tryParse(entry['date'] ?? '');
-      return date == null || date.isAfter(cutoff);
-    }).toList();
-    await prefs.setString(_keySimilarBandHistory, jsonEncode(trimmed));
+    await _markHeadlineRotationUsed(prefs, id);
+  }
+
+  /// Public getter so Explore can exclude the whole current rotation
+  /// cycle's used set from its "similar to this headline" band --
+  /// not just today's two literal headlines -- so a reflection that's
+  /// already had its turn this cycle can't even be offered there,
+  /// let alone picked.
+  Future<Set<String>> getHeadlineRotationUsedIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    return _getRotationUsed(prefs);
   }
 
   Future<EmbeddedReflection> rerollSlot({
