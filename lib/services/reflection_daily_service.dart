@@ -100,18 +100,16 @@ class ReflectionDailyService {
   /// pressure.
   final int hardExcludeCount;
 
-  /// Floor below which the ranked path's top-fraction cutoff gets
-  /// relaxed rather than leaving a near-empty pool to pick from.
-  final int minCandidateFloor;
-
-  /// Fraction of the ranked corpus excluded as "worst match" before
-  /// picking randomly from the rest, when a mood context vector is
-  /// available. Only applies to the ranked path -- the random path
-  /// (no mood given) has no scores to cut by, so it filters the whole
-  /// corpus down by exclusion set alone. 0.20 mirrors the old
-  /// on-demand-only value: now that every ranked pick is mood-driven,
-  /// mood's signal is trusted the same way everywhere.
-  final double exclusionFraction;
+  /// Controls how strongly picks favor high-scoring reflections vs.
+  /// spreading evenly across the whole corpus -- see
+  /// ReflectionEmbeddingService.sampleWeighted's doc comment for the
+  /// full explanation. Replaces the old exclusionFraction/
+  /// minCandidateFloor hard-cutoff approach: instead of permanently
+  /// excluding a fixed worst-fraction of the ranked corpus (which made
+  /// anything scoring low across most contexts permanently
+  /// unreachable, no matter how rotation/recency cycled), every
+  /// candidate now gets a real, non-zero chance, scaled by fit.
+  final double samplingTemperature;
 
   final Random _random;
 
@@ -119,8 +117,7 @@ class ReflectionDailyService {
     ReflectionEmbeddingService? embeddingService,
     this.recencyWindowDays = 14,
     this.hardExcludeCount = 3,
-    this.minCandidateFloor = 15,
-    this.exclusionFraction = 0.20,
+    this.samplingTemperature = 0.18,
     Random? random,
   })  : _embeddingService = embeddingService ?? ReflectionEmbeddingService(),
         _random = random ?? Random();
@@ -284,44 +281,36 @@ class ReflectionDailyService {
     return _pickFrom(pool);
   }
 
-  /// Builds one tier's candidate list:
-  ///   - [contextVector] non-null → rank the corpus against it, keep
-  ///     the top [exclusionFraction]-adjusted slice (via
-  ///     `_topFraction`), excluding [excludeIds].
-  ///   - [contextVector] null → the random path: just the corpus minus
-  ///     [excludeIds], no ranking or scoring at all.
-  Future<List<EmbeddedReflection>> _candidatePool(
+  /// Builds one tier's candidate list, ALWAYS as scored candidates:
+  ///   - [contextVector] non-null → rank the full corpus against it,
+  ///     excluding [excludeIds]. No cutoff -- every non-excluded
+  ///     reflection stays in, to be weighted (not filtered) by
+  ///     `_pickFrom`.
+  ///   - [contextVector] null → the random path: every non-excluded
+  ///     reflection, each given an equal placeholder score (0.0), so
+  ///     `_pickFrom`'s weighted sampling degenerates to a plain uniform
+  ///     pick -- same function, no separate random-path logic needed.
+  Future<List<ScoredReflection>> _candidatePool(
     List<double>? contextVector, {
     required Set<String> excludeIds,
   }) async {
     if (contextVector == null) {
       final all = await _embeddingService.allReflections();
-      return all.where((r) => !excludeIds.contains(r.id)).toList();
+      return all
+          .where((r) => !excludeIds.contains(r.id))
+          .map((r) => ScoredReflection(r, 0.0))
+          .toList();
     }
 
-    final ranked = await _embeddingService.rank(
-      contextVector,
-      excludeIds: excludeIds,
+    return _embeddingService.rank(contextVector, excludeIds: excludeIds);
+  }
+
+  EmbeddedReflection _pickFrom(List<ScoredReflection> pool) {
+    return _embeddingService.sampleWeighted(
+      pool,
+      temperature: samplingTemperature,
+      random: _random,
     );
-    return _topFraction(ranked, exclusionFraction)
-        .map((s) => s.reflection)
-        .toList();
-  }
-
-  EmbeddedReflection _pickFrom(List<EmbeddedReflection> pool) {
-    return pool[_random.nextInt(pool.length)];
-  }
-
-  /// Keeps the top (1 - [exclusionFraction]) of [ranked], but never
-  /// fewer than [minCandidateFloor] (or the whole list, if smaller).
-  List<ScoredReflection> _topFraction(
-    List<ScoredReflection> ranked,
-    double fraction,
-  ) {
-    if (ranked.isEmpty) return ranked;
-    final byFraction = (ranked.length * (1 - fraction)).ceil();
-    final count = max(byFraction, min(minCandidateFloor, ranked.length));
-    return ranked.take(count).toList();
   }
 
   // ---------------------------------------------------------------------

@@ -177,6 +177,67 @@ class ReflectionEmbeddingService {
     return candidates;
   }
 
+  /// Picks ONE reflection from [ranked] using weighted random sampling
+  /// across the WHOLE list, instead of a hard cutoff (top-N or
+  /// top-fraction).
+  ///
+  /// Why this matters: any hard cutoff -- whether a fixed count or a
+  /// fixed fraction like the old `_topFraction` -- permanently excludes
+  /// whatever falls below it FOR THAT CONTEXT. If a reflection happens
+  /// to score in the excluded slice across most/all contexts it could
+  /// ever be evaluated against (which a corpus with uneven vocabulary
+  /// overlap against a small set of context anchors will produce for a
+  /// real chunk of it), that reflection becomes permanently
+  /// unreachable via the ranked path -- no rotation reset or recency
+  /// expiry can fix that, since the exclusion happens fresh, every
+  /// time, before rotation/recency even get involved.
+  ///
+  /// This method instead converts every score into a probability (via
+  /// softmax) and draws from the full list, so every candidate has
+  /// SOME chance, proportional to how well it actually fits. A random
+  /// pick (no scores, i.e. every [ScoredReflection.score] equal) is
+  /// just a special case of this: softmax over equal values IS the
+  /// uniform distribution, so the same function correctly covers both
+  /// the mood-ranked path and the random path -- no separate pick
+  /// function needed for each.
+  ///
+  /// [temperature] controls how strongly the pick favors high-scoring
+  /// reflections vs. spreading evenly across all of them:
+  ///   - Lower (e.g. 0.05-0.10): sharper bias toward the best matches.
+  ///   - Higher (e.g. 0.30-0.50): flatter, closer to uniform regardless
+  ///     of context fit.
+  ///   - A good starting point for this kind of text (cosine scores
+  ///     roughly in the 0.1-0.6 range) is 0.15-0.20 -- tune by feel.
+  EmbeddedReflection sampleWeighted(
+    List<ScoredReflection> ranked, {
+    double temperature = 0.18,
+    Random? random,
+  }) {
+    if (ranked.isEmpty) {
+      throw StateError('sampleWeighted called with an empty ranked list');
+    }
+
+    final rnd = random ?? Random();
+
+    // Softmax over the scores. Subtracting the max score first is a
+    // standard numerical-stability trick (keeps exp() from overflowing)
+    // and doesn't change the resulting probabilities at all.
+    final maxScore = ranked.map((r) => r.score).reduce(max);
+    final weights = ranked
+        .map((r) => exp((r.score - maxScore) / temperature))
+        .toList();
+    final totalWeight = weights.reduce((a, b) => a + b);
+
+    var target = rnd.nextDouble() * totalWeight;
+    for (var i = 0; i < ranked.length; i++) {
+      target -= weights[i];
+      if (target <= 0) return ranked[i].reflection;
+    }
+
+    // Floating-point safety net -- should be unreachable in practice.
+    return ranked.last.reflection;
+  }
+
   /// Narrows an already-[rank]ed list down to reflections that are
   /// genuinely close to the top match, rather than an arbitrary fixed
   /// count.

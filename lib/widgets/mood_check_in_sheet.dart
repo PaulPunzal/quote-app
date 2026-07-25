@@ -62,9 +62,9 @@ class MoodCheckInSheet extends StatefulWidget {
   const MoodCheckInSheet({super.key, required this.embeddingService});
 
   /// Convenience: shows the sheet and returns the [MoodCheckInResult].
-  /// A dismissal with nothing selected (backdrop tap, back button, or
-  /// any other way `Navigator.pop` ends up called with no value) maps
-  /// to [MoodCancelled] here, so callers never have to treat a bare
+  /// A dismissal with nothing selected (tapping the backdrop, since
+  /// drag-to-dismiss stays off to avoid accidental swipes) maps to
+  /// [MoodCancelled] here, so callers never have to treat a bare
   /// `null` as a fourth, unhandled case.
   static Future<MoodCheckInResult> show(
     BuildContext context, {
@@ -74,7 +74,7 @@ class MoodCheckInSheet extends StatefulWidget {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      isDismissible: false,
+      isDismissible: true,
       enableDrag: false,
       builder: (_) => MoodCheckInSheet(
         embeddingService: embeddingService ?? ReflectionEmbeddingService(),
